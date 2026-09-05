@@ -1,4 +1,4 @@
-"""Application settings loaded from .env / environment variables."""
+""".env と環境変数からアプリケーション設定を読み込む。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Small, validated configuration surface for the demo app."""
+    """デモアプリの設定値と入力検証をまとめる。"""
 
     model_config = SettingsConfigDict(
         env_file=Path(".env"),

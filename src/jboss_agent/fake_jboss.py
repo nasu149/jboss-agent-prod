@@ -1,8 +1,7 @@
-"""File-backed Fake JBoss used by the demo application.
+"""デモ用の Fake JBoss。状態をファイルに保存する。
 
-The fake implementation intentionally keeps state on disk so a LangGraph process
-and a separate stdio MCP server process observe the same server. Ground truth is
-not stored in this Agent-visible state.
+LangGraph と別プロセスの MCP サーバーが同じサーバー状態を参照できるようにする。
+Agent が参照するこの状態には、シミュレーターの正解情報を含めない。
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any
-
 
 _DEFAULT_STATE: dict[str, Any] = {
     "server_id": "jboss-01",
@@ -51,7 +49,7 @@ _DEFAULT_BOOT_LOGS = [
 
 
 class FakeJBossOperations:
-    """Small deterministic JBoss simulator behind the MCP capability boundary."""
+    """MCP 経由で公開する、動作が決定的な JBoss シミュレーター。"""
 
     def __init__(self, data_dir: str | Path, *, server_id: str = "jboss-01") -> None:
         self.data_dir = Path(data_dir)
@@ -103,7 +101,7 @@ class FakeJBossOperations:
         return {"from_cursor": from_cursor, "to_cursor": to_cursor}
 
     # ------------------------------------------------------------------
-    # Read-only capabilities
+    # 読み取り専用の操作
     # ------------------------------------------------------------------
     def read_server_log(self, server_id: str, cursor: int) -> dict[str, object]:
         self._validate_server_id(server_id)
@@ -150,7 +148,7 @@ class FakeJBossOperations:
         return {"server_id": server_id, "changes": list(self._read_state()["recent_config_changes"])}
 
     # ------------------------------------------------------------------
-    # Validated write capabilities
+    # 入力検証を行う書き込み操作
     # ------------------------------------------------------------------
     def set_thread_pool_max_threads(self, server_id: str, value: int) -> dict[str, object]:
         self._validate_server_id(server_id)
@@ -164,7 +162,7 @@ class FakeJBossOperations:
             changed = old != value
             pool["max_threads"] = value
 
-            # Simulate backlog drainage when capacity is restored.
+            # 処理能力が戻ったときに、滞留中のタスクが解消する動作を再現する。
             if value > old and int(pool["active_threads"]) <= value:
                 pool["queue_size"] = 0
                 pool["rejected_tasks"] = 0
@@ -281,7 +279,7 @@ class FakeJBossOperations:
         }
 
     # ------------------------------------------------------------------
-    # Simulator-only helpers. These are never exposed as MCP tools.
+    # シミュレーター専用の補助処理。MCP ツールとしては公開しない。
     # ------------------------------------------------------------------
     def simulate_thread_pool_load(
         self,
@@ -326,7 +324,7 @@ class FakeJBossOperations:
             self._write_state_unlocked(state)
 
     # ------------------------------------------------------------------
-    # File helpers
+    # ファイル操作の補助処理
     # ------------------------------------------------------------------
     def ensure_initialized_without_logs_if_needed(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

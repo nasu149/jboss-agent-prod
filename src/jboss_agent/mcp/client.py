@@ -1,4 +1,4 @@
-"""LangChain adapter for the separate Fake JBoss MCP server process."""
+"""別プロセスの Fake JBoss MCP サーバーを LangChain から利用するアダプター。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from collections.abc import Iterable
 from typing import Any, Protocol
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
-
 
 READ_TOOL_NAMES = frozenset(
     {
@@ -50,7 +49,7 @@ def validate_toolset(tools: Iterable[NamedTool]) -> None:
 
 
 def build_mcp_client() -> MultiServerMCPClient:
-    """Start the local MCP server over stdio when tools are requested."""
+    """ツール取得時に、標準入出力で通信するローカル MCP サーバーを起動する。"""
     return MultiServerMCPClient(
         {
             "fake_jboss": {
@@ -63,7 +62,7 @@ def build_mcp_client() -> MultiServerMCPClient:
 
 
 async def load_jboss_tools() -> tuple[list[Any], list[Any]]:
-    """Return strict read-only and write-only tool sets."""
+    """読み取り専用と書き込み専用のツールを厳密に分離して返す。"""
     client = build_mcp_client()
     all_tools = list(await client.get_tools())
     validate_toolset(all_tools)

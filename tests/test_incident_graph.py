@@ -53,7 +53,7 @@ async def test_incident_pauses_for_approval_then_executes_write_and_recovers() -
 
     @tool
     def get_thread_pool_status(server_id: str) -> dict[str, object]:
-        """Read thread pool."""
+        """スレッドプールの状態を読み取る。"""
         return {
             "server_id": server_id,
             "max_threads": state["max_threads"],
@@ -64,12 +64,12 @@ async def test_incident_pauses_for_approval_then_executes_write_and_recovers() -
 
     @tool
     def get_server_health(server_id: str) -> dict[str, object]:
-        """Read server health."""
+        """サーバーの健康状態を読み取る。"""
         return {"server_id": server_id, "status": "UP", "request_error_rate": state["error_rate"]}
 
     @tool
     def set_thread_pool_max_threads(server_id: str, value: int) -> dict[str, object]:
-        """Change thread-pool capacity."""
+        """スレッドプールの上限を変更する。"""
         state.update(max_threads=value, queue=0, rejected=0, error_rate=0.0)
         return {"server_id": server_id, "value": value, "success": True}
 

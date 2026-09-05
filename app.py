@@ -1,4 +1,4 @@
-"""Streamlit entry point for the JBoss incident-response demo."""
+"""JBoss 障害対応デモの Streamlit 起動モジュール。"""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ from jboss_agent.simulator import (
     normalize_diagnosis,
 )
 
-
 settings = get_settings()
 runtime = RuntimeStore(settings.runtime_db_path)
 truth = GroundTruthStore(settings.simulator_db_path)
@@ -30,7 +29,7 @@ service = AgentService(settings, runtime, truth)
 
 
 def run_async(coro: Any) -> Any:
-    """Streamlit callbacks are synchronous; each action gets a short-lived event loop."""
+    """同期処理の Streamlit から、操作ごとにイベントループを作って非同期処理を実行する。"""
     return asyncio.run(coro)
 
 
@@ -39,8 +38,8 @@ def run_agent_action(coro: Any, label: str) -> bool:
         with st.spinner(label):
             run_async(coro)
         return True
-    except Exception as exc:  # Surface operational errors in the UI instead of a raw traceback.
-        st.error(f"Agent execution failed: {exc}")
+    except Exception as exc:  # 操作中のエラーは、画面上のメッセージとして表示する。
+        st.error(f"エージェントの処理に失敗しました: {exc}")
         return False
 
 
@@ -54,7 +53,7 @@ def render_sidebar() -> None:
         st.markdown(
             "1. **Inject Random Event**\n"
             "2. **Run scan now**\n"
-            "3. If remediation is proposed, **Approve / Reject**\n"
+            "3. 対処案が表示されたら、**承認して実行 / 拒否する**\n"
             "4. Check the incident and activity tables"
         )
         st.divider()
@@ -85,8 +84,7 @@ def render_server_snapshot() -> None:
         help=f"timeouts={datasource['timed_out_requests']}",
     )
     st.caption(
-        f"Deployment {deployment['name']}: status={deployment['status']}, "
-        f"enabled={deployment['enabled']}"
+        f"Deployment {deployment['name']}: status={deployment['status']}, enabled={deployment['enabled']}"
     )
 
 
@@ -146,57 +144,76 @@ def render_controls() -> None:
 
 def render_approvals() -> None:
     pending = runtime.list_pending_approvals()
-    st.subheader("Human approval")
+    st.subheader("復旧操作の承認")
     if not pending:
-        st.info("No pending remediation approval.")
+        st.info("承認待ちの復旧操作はありません。")
         return
 
+    st.caption(
+        "対処内容を確認してください。承認するとサーバーへの変更を実行します。拒否すると変更せずに終了します。"
+    )
     for record in pending:
         payload = record.pending_approval or {}
         with st.container(border=True):
-            st.markdown(f"**Incident `{record.incident_id}`**")
+            st.markdown(f"**対象の障害: `{record.incident_id}`**")
+            st.caption(f"対象サーバー: {record.server_id}")
             c1, c2, c3 = st.columns(3)
-            c1.write(f"Action: `{payload.get('action')}`")
-            c2.write(f"Risk: **{payload.get('risk')}**")
-            c3.write(
-                f"Current → proposed: `{payload.get('current_value')}` → "
-                f"`{payload.get('proposed_value')}`"
-            )
-            st.write(payload.get("reason") or "No reason supplied")
+            # 内部の操作コードは維持し、人が判断する画面では日本語の名称を使う。
+            action_labels = {
+                "SET_THREAD_POOL_MAX_THREADS": "スレッドプールの最大スレッド数を変更",
+                "SET_DATASOURCE_MAX_POOL_SIZE": "データソースの最大接続数を変更",
+                "RESTART_DEPLOYMENT": "アプリケーションを再起動",
+                "RELOAD_SERVER": "サーバーを再読み込み",
+                "NONE": "変更なし",
+            }
+            risk_labels = {"LOW": "低", "MEDIUM": "中", "HIGH": "高", "BLOCKED": "実行不可"}
+            c1.write(f"操作: {action_labels.get(payload.get('action'), '不明な操作')}")
+            c2.write(f"リスク: **{risk_labels.get(payload.get('risk'), '不明')}**")
+            if payload.get("proposed_value") is not None:
+                current = payload.get("current_value")
+                c3.write(
+                    f"現在の値 → 変更後の値: `{current if current is not None else '不明'}` → `{payload['proposed_value']}`"
+                )
+            elif payload.get("deployment_name"):
+                c3.write(f"対象アプリケーション: `{payload['deployment_name']}`")
+            else:
+                c3.write("対象: サーバー全体")
+            st.write("提案理由: " + (payload.get("reason") or "理由は提示されていません。"))
 
             approve, reject = st.columns(2)
             if approve.button(
-                "Approve",
+                "承認して実行",
                 key=f"approve-{record.incident_id}",
                 use_container_width=True,
             ):
                 if run_agent_action(
                     service.resume_incident(record.incident_id, decision="approve"),
-                    "Resuming the same LangGraph thread...",
+                    "承認した復旧操作を実行しています...",
                 ):
                     st.rerun()
 
             if reject.button(
-                "Reject",
+                "拒否する",
                 key=f"reject-{record.incident_id}",
                 use_container_width=True,
             ):
                 if run_agent_action(
                     service.resume_incident(record.incident_id, decision="reject"),
-                    "Rejecting remediation...",
+                    "復旧操作を拒否して終了しています...",
                 ):
                     st.rerun()
 
             default_value = payload.get("proposed_value")
+            # 編集された値もグラフ側で安全ルールを再検証してから実行する。
             if isinstance(default_value, int):
                 edited = st.number_input(
-                    "Edit proposed value",
+                    "変更後の値を編集",
                     value=default_value,
                     step=1,
                     key=f"edit-value-{record.incident_id}",
                 )
                 if st.button(
-                    "Edit & Approve",
+                    "編集した値で承認・実行",
                     key=f"edit-approve-{record.incident_id}",
                     use_container_width=True,
                 ):
@@ -206,7 +223,7 @@ def render_approvals() -> None:
                             decision="edit_and_approve",
                             proposed_value=int(edited),
                         ),
-                        "Validating the edited value and resuming...",
+                        "編集した値の安全性を確認し、復旧操作を実行しています...",
                     ):
                         st.rerun()
 
@@ -222,7 +239,16 @@ def render_incidents() -> None:
         [
             {
                 "incident_id": item.incident_id,
-                "status": item.status,
+                "status": {
+                    "INVESTIGATING": "調査中",
+                    "PENDING_APPROVAL": "承認待ち",
+                    "REJECTED": "拒否済み",
+                    "BLOCKED": "安全ルールにより中止",
+                    "RECOVERED": "復旧済み",
+                    "RESOLVED_NO_ACTION": "変更なしで完了",
+                    "FAILED_SAFE": "復旧失敗・担当者の対応待ち",
+                    "COMPLETED": "完了",
+                }.get(item.status, item.status),
                 "category": item.category,
                 "severity": item.severity,
                 "confidence": item.confidence,
@@ -267,11 +293,7 @@ def render_ground_truth() -> None:
         st.write(f"Recovery: **{'Success' if record.recovered else 'Failed / not applicable'}**")
     else:
         st.write("Agent created no incident.")
-        st.write(
-            "Detection: **Correct**"
-            if event.scenario == "NORMAL_ACTIVITY"
-            else "Detection: **Missed**"
-        )
+        st.write("Detection: **Correct**" if event.scenario == "NORMAL_ACTIVITY" else "Detection: **Missed**")
 
 
 def render_activity() -> None:

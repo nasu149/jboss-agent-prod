@@ -1,1 +1,1 @@
-"""LangGraph workflow definitions."""
+"""LangGraph のワークフロー定義。"""

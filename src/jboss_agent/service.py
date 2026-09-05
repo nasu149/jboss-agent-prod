@@ -1,4 +1,4 @@
-"""Application service that connects the two LangGraph workflows to the UI."""
+"""2つの LangGraph ワークフローと UI をつなぐアプリケーションサービス。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class AgentService:
         self.truth = truth
 
     async def run_scan(self) -> dict[str, Any]:
-        """Run one monitoring cycle; if needed, continue into incident handling."""
+        """監視を1回実行し、障害を検出した場合は調査・対応へ進む。"""
         server_id = self.settings.server_id
         self.runtime.begin_scan(server_id)
 
@@ -64,7 +64,7 @@ class AgentService:
                     summary=str(monitoring.get("summary", "Incident detected")),
                     status="INVESTIGATING",
                 )
-                # The simulator answer is linked by ID only; it is never placed in Agent State.
+                # 正解情報は ID でのみ関連付け、Agent の状態には渡さない。
                 self.truth.link_latest_unlinked(server_id, incident_id)
                 self.runtime.add_activity(
                     server_id,
@@ -124,6 +124,7 @@ class AgentService:
                 checkpointer=checkpointer,
                 settings=self.settings,
             )
+            # 同じ thread_id の保存状態を復元し、承認待ちの interrupt に判断結果を渡す。
             result = await graph.ainvoke(
                 Command(resume=payload),
                 config={"configurable": {"thread_id": record.thread_id}},
@@ -172,19 +173,19 @@ class AgentService:
         failure_reason = result.get("failure_reason")
 
         if pending is not None:
-            status, activity = "PENDING_APPROVAL", "Investigation paused for human approval"
+            status, activity = "PENDING_APPROVAL", "調査を一時停止し、復旧操作の承認を待っています"
         elif approval == "REJECTED":
-            status, activity = "REJECTED", "Human rejected remediation; no write executed"
+            status, activity = "REJECTED", "復旧操作が拒否されました。書き込みは実行していません"
         elif approval == "BLOCKED":
-            status, activity = "BLOCKED", "Remediation blocked by policy"
+            status, activity = "BLOCKED", "安全ルールにより復旧操作を中止しました"
         elif recovered is True:
             no_action = (proposed_action or {}).get("type") == "NONE"
             status = "RESOLVED_NO_ACTION" if no_action else "RECOVERED"
-            activity = "Incident workflow completed successfully"
+            activity = "障害対応が正常に完了しました"
         elif recovered is False:
-            status, activity = "FAILED_SAFE", "Recovery failed; fail-safe escalation reached"
+            status, activity = "FAILED_SAFE", "復旧できなかったため処理を停止しました。運用担当者の対応が必要です"
         else:
-            status, activity = "COMPLETED", "Incident workflow completed"
+            status, activity = "COMPLETED", "障害対応が完了しました"
 
         read_names = _read_tool_names(result.get("messages", []))
         self.runtime.upsert_incident(
@@ -211,7 +212,7 @@ class AgentService:
             self.runtime.add_activity(server_id, "diagnosis", f"Diagnosis: {diagnosis.get('root_cause', 'UNKNOWN')}", incident_id=incident_id)
         execution = result.get("execution_result")
         if isinstance(execution, dict) and execution.get("tool_name"):
-            self.runtime.add_activity(server_id, "write_tool", f"Executed approved MCP write tool: {execution['tool_name']}", incident_id=incident_id)
+            self.runtime.add_activity(server_id, "write_tool", f"承認された MCP 書き込みツールを実行しました: {execution['tool_name']}", incident_id=incident_id)
         self.runtime.add_activity(server_id, "incident", activity, incident_id=incident_id, details={"status": status})
 
 

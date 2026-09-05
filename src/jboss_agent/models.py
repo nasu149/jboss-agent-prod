@@ -1,4 +1,4 @@
-"""Structured LLM outputs and shared domain types."""
+"""LLM の構造化出力と、各処理で共有するデータ型を定義する。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Incident Graph: investigate -> diagnose -> approve -> write -> verify."""
+"""障害対応グラフ：調査 → 診断 → 人による承認 → 書き込み → 復旧確認。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from jboss_agent.llm import build_diagnoser, build_investigator
 from jboss_agent.models import ApprovalResponse, IncidentDiagnosis
 from jboss_agent.policy import evaluate_action
 from jboss_agent.tool_results import normalize_tool_result
-
 
 
 def _prepare_investigation(state: IncidentState) -> dict[str, object]:
@@ -119,7 +118,7 @@ def _route_after_policy(state: IncidentState) -> str:
 
 
 def _approval(state: IncidentState) -> dict[str, object]:
-    """Pause before side effects. Nothing before interrupt() mutates JBoss."""
+    """JBoss を変更する前に承認を待つ。interrupt() より前には変更処理を置かない。"""
     action = dict(state.get("proposed_action") or {})
     payload = {
         "type": "approval_required",
@@ -132,9 +131,10 @@ def _approval(state: IncidentState) -> dict[str, object]:
         "reason": (state.get("diagnosis") or {}).get("reason"),
         "risk": state.get("risk_level"),
     }
+    # ここで状態を保存して人の判断を待つ。再開時には、このノードの先頭から再実行される。
     raw = interrupt(payload)
     if not isinstance(raw, Mapping):
-        raise ValueError("approval resume value must be an object")
+        raise ValueError("承認結果はオブジェクト形式で指定してください。")
     response = ApprovalResponse.model_validate(dict(raw))
 
     trace = [*state.get("node_trace", []), "approval"]
@@ -143,8 +143,13 @@ def _approval(state: IncidentState) -> dict[str, object]:
 
     if response.decision == "edit_and_approve":
         if response.proposed_value is None:
-            return {"approval_status": "BLOCKED", "policy_reason": "edited value is required", "node_trace": trace}
+            return {
+                "approval_status": "BLOCKED",
+                "policy_reason": "編集後の値を指定してください。",
+                "node_trace": trace,
+            }
         action["proposed_value"] = response.proposed_value
+        # 人が編集した値も、LLM の提案と同じ安全ルールで検証する。
         checked = evaluate_action(action)
         if not checked.allowed:
             return {
@@ -176,9 +181,9 @@ def _route_after_approval(state: IncidentState) -> str:
 def _write_call(state: IncidentState) -> tuple[str, dict[str, object]]:
     checked = evaluate_action(state.get("proposed_action"))
     if state.get("approval_status") != "APPROVED":
-        raise PermissionError("write execution requires human approval")
+        raise PermissionError("書き込み操作には人による承認が必要です。")
     if not checked.allowed or checked.risk == "BLOCKED":
-        raise PermissionError(f"write action blocked: {checked.reason}")
+        raise PermissionError(f"書き込み操作を中止しました: {checked.reason}")
 
     action = checked.normalized_action
     server_id = state["server_id"]
@@ -194,10 +199,13 @@ def _write_call(state: IncidentState) -> tuple[str, dict[str, object]]:
 
 
 def _prepare_write(state: IncidentState) -> dict[str, object]:
+    # 承認済みかを再確認し、Python が書き込みツールと引数を決定する。
     name, args = _write_call(state)
     message = AIMessage(
         content="",
-        tool_calls=[{"name": name, "args": args, "id": f"write-{uuid.uuid4().hex[:12]}", "type": "tool_call"}],
+        tool_calls=[
+            {"name": name, "args": args, "id": f"write-{uuid.uuid4().hex[:12]}", "type": "tool_call"}
+        ],
     )
     return {"messages": [message], "node_trace": [*state.get("node_trace", []), "prepare_write"]}
 
@@ -230,26 +238,36 @@ def make_verify_node(read_tools: Sequence[Any]):
         action_type = (state.get("proposed_action") or {}).get("type")
         health = normalize_tool_result(await tools["get_server_health"].ainvoke({"server_id": server_id}))
         details: dict[str, Any] = {"health": health}
+        # 復旧は LLM の自己申告ではなく、実際に取得したメトリクスで判定する。
         healthy = health.get("status") == "UP" and float(health.get("request_error_rate", 1.0)) < 0.05
 
         if action_type == "SET_THREAD_POOL_MAX_THREADS":
-            pool = normalize_tool_result(await tools["get_thread_pool_status"].ainvoke({"server_id": server_id}))
+            pool = normalize_tool_result(
+                await tools["get_thread_pool_status"].ainvoke({"server_id": server_id})
+            )
             details["thread_pool"] = pool
             healthy = healthy and int(pool.get("active_threads", 10**9)) <= int(pool.get("max_threads", -1))
-            healthy = healthy and int(pool.get("queue_size", 1)) == 0 and int(pool.get("rejected_tasks", 1)) == 0
+            healthy = (
+                healthy and int(pool.get("queue_size", 1)) == 0 and int(pool.get("rejected_tasks", 1)) == 0
+            )
         elif action_type == "SET_DATASOURCE_MAX_POOL_SIZE":
             ds = normalize_tool_result(await tools["get_datasource_status"].ainvoke({"server_id": server_id}))
             details["datasource"] = ds
             healthy = healthy and int(ds.get("active_count", 10**9)) <= int(ds.get("max_pool_size", -1))
             healthy = healthy and int(ds.get("timed_out_requests", 1)) == 0
         elif action_type == "RESTART_DEPLOYMENT":
-            deployment = normalize_tool_result(await tools["get_deployment_status"].ainvoke({"server_id": server_id}))
+            deployment = normalize_tool_result(
+                await tools["get_deployment_status"].ainvoke({"server_id": server_id})
+            )
             details["deployment"] = deployment
             healthy = healthy and deployment.get("status") == "OK" and bool(deployment.get("enabled"))
 
         return {
             "recovered": healthy,
-            "evidence": [*state.get("evidence", []), {"tool_name": "recovery_verification", "content": details}],
+            "evidence": [
+                *state.get("evidence", []),
+                {"tool_name": "recovery_verification", "content": details},
+            ],
             "node_trace": [*state.get("node_trace", []), "verify_recovery"],
         }
 
@@ -267,7 +285,11 @@ def make_recovery_route(max_attempts: int):
 
 def _prepare_retry(state: IncidentState) -> dict[str, object]:
     return {
-        "messages": [HumanMessage(content="The approved remediation did not recover the server. Re-investigate with read-only tools and challenge the previous diagnosis.")],
+        "messages": [
+            HumanMessage(
+                content="The approved remediation did not recover the server. Re-investigate with read-only tools and challenge the previous diagnosis."
+            )
+        ],
         "investigation_count": 0,
         "diagnosis": None,
         "proposed_action": None,
@@ -281,11 +303,18 @@ def _prepare_retry(state: IncidentState) -> dict[str, object]:
 
 
 def _rejected(state: IncidentState) -> dict[str, object]:
-    return {"failure_reason": "Human rejected the proposed write operation.", "node_trace": [*state.get("node_trace", []), "rejected"]}
+    return {
+        "failure_reason": "提案された変更は人によって拒否されました。",
+        "node_trace": [*state.get("node_trace", []), "rejected"],
+    }
 
 
 def _blocked(state: IncidentState) -> dict[str, object]:
-    return {"approval_status": "BLOCKED", "failure_reason": state.get("policy_reason") or "Action blocked by policy.", "node_trace": [*state.get("node_trace", []), "blocked"]}
+    return {
+        "approval_status": "BLOCKED",
+        "failure_reason": state.get("policy_reason") or "安全ルールにより操作を中止しました。",
+        "node_trace": [*state.get("node_trace", []), "blocked"],
+    }
 
 
 def _no_action(state: IncidentState) -> dict[str, object]:
@@ -297,7 +326,11 @@ def _recovered(state: IncidentState) -> dict[str, object]:
 
 
 def _fail_safe(state: IncidentState) -> dict[str, object]:
-    return {"recovered": False, "failure_reason": "Maximum recovery attempts reached; escalate to a human operator.", "node_trace": [*state.get("node_trace", []), "fail_safe"]}
+    return {
+        "recovered": False,
+        "failure_reason": "復旧試行回数の上限に達しました。運用担当者による対応が必要です。",
+        "node_trace": [*state.get("node_trace", []), "fail_safe"],
+    }
 
 
 def build_incident_graph(
@@ -338,16 +371,34 @@ def build_incident_graph(
 
     graph.add_edge(START, "prepare_investigation")
     graph.add_edge("prepare_investigation", "investigate")
-    graph.add_conditional_edges("investigate", _route_after_investigate, {"read_tools": "read_tools", "diagnose": "diagnose"})
+    graph.add_conditional_edges(
+        "investigate", _route_after_investigate, {"read_tools": "read_tools", "diagnose": "diagnose"}
+    )
     graph.add_edge("read_tools", "record_evidence")
-    graph.add_conditional_edges("record_evidence", make_round_route(settings.max_investigation_rounds), {"investigate": "investigate", "diagnose": "diagnose"})
+    graph.add_conditional_edges(
+        "record_evidence",
+        make_round_route(settings.max_investigation_rounds),
+        {"investigate": "investigate", "diagnose": "diagnose"},
+    )
     graph.add_edge("diagnose", "validate_action")
-    graph.add_conditional_edges("validate_action", _route_after_policy, {"approval": "approval", "blocked": "blocked", "no_action": "no_action"})
-    graph.add_conditional_edges("approval", _route_after_approval, {"approved": "prepare_write", "rejected": "rejected", "blocked": "blocked"})
+    graph.add_conditional_edges(
+        "validate_action",
+        _route_after_policy,
+        {"approval": "approval", "blocked": "blocked", "no_action": "no_action"},
+    )
+    graph.add_conditional_edges(
+        "approval",
+        _route_after_approval,
+        {"approved": "prepare_write", "rejected": "rejected", "blocked": "blocked"},
+    )
     graph.add_edge("prepare_write", "write_tools")
     graph.add_edge("write_tools", "capture_write")
     graph.add_edge("capture_write", "verify_recovery")
-    graph.add_conditional_edges("verify_recovery", make_recovery_route(settings.max_recovery_attempts), {"recovered": "recovered", "retry": "prepare_retry", "fail_safe": "fail_safe"})
+    graph.add_conditional_edges(
+        "verify_recovery",
+        make_recovery_route(settings.max_recovery_attempts),
+        {"recovered": "recovered", "retry": "prepare_retry", "fail_safe": "fail_safe"},
+    )
     graph.add_edge("prepare_retry", "investigate")
     for terminal in ("recovered", "rejected", "blocked", "no_action", "fail_safe"):
         graph.add_edge(terminal, END)

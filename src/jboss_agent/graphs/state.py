@@ -1,4 +1,4 @@
-"""The two small LangGraph State schemas used by the application."""
+"""監視と障害対応で使用する、2種類の LangGraph の状態スキーマ。"""
 
 from __future__ import annotations
 
@@ -31,8 +31,8 @@ class MonitoringState(TypedDict, total=False):
 
 
 class IncidentState(TypedDict, total=False):
-    # add_messages is the reducer: nodes can return only new messages and LangGraph
-    # appends/merges them into the conversation history.
+    # add_messages が会話履歴を統合するため、各ノードは新しいメッセージだけを返せる。
+    # 既存のメッセージは保持し、同じ ID のメッセージは更新する。
     messages: Annotated[list[Any], add_messages]
     incident_id: str
     server_id: str

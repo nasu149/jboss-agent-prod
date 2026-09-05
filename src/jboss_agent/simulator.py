@@ -1,4 +1,4 @@
-"""Demo fault injection and simulator-only Ground Truth storage."""
+"""デモの障害注入と、シミュレーター専用の正解情報の保存を行う。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from typing import Literal
 
 from jboss_agent.fake_jboss import FakeJBossOperations
 from jboss_agent.runtime_store import utc_now_iso
-
 
 Scenario = Literal[
     "THREAD_POOL_CONFIGURATION",
@@ -37,7 +36,7 @@ class GroundTruthEvent:
 
 
 class GroundTruthStore:
-    """Kept separate so the Agent cannot read the answer from Fake JBoss state."""
+    """Agent が Fake JBoss の状態から正解を読めないよう、保存先を分離する。"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -114,13 +113,15 @@ class FaultInjector:
     def inject(self, scenario: Scenario) -> GroundTruthEvent:
         event_id = f"evt-{uuid.uuid4().hex[:10]}"
         self.fake.ensure_initialized()
-        # Scenarios are independent demonstrations. Reset server metrics/configuration
-        # but keep server.log append-only so the monitoring cursor remains valid.
+        # 各シナリオを独立して試せるよう、メトリクスと設定だけを初期化する。
+        # 監視カーソルを維持するため、server.log は追記された状態を保つ。
         self.fake.restore_baseline_state()
 
         if scenario == "THREAD_POOL_CONFIGURATION":
             self.fake.set_thread_pool_max_threads(self.fake.server_id, 20)
-            self.fake.simulate_thread_pool_load(active_threads=20, queue_size=37, rejected_tasks=11, error_rate=0.24)
+            self.fake.simulate_thread_pool_load(
+                active_threads=20, queue_size=37, rejected_tasks=11, error_rate=0.24
+            )
             self.fake.append_log_lines(
                 [
                     "2026-09-05 18:20:01 WARN  [org.example.web] HTTP worker queue growth detected",

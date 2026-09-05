@@ -1,1 +1,1 @@
-"""MCP integration for the Fake JBoss server."""
+"""Fake JBoss サーバーとの MCP 連携。"""

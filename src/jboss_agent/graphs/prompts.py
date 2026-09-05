@@ -1,11 +1,10 @@
-"""Prompts kept in one place so LLM responsibilities are easy to inspect."""
+"""LLM に任せる判断を確認しやすいよう、プロンプトを集約する。"""
 
 from __future__ import annotations
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from jboss_agent.graphs.state import IncidentState
-
 
 LOG_CLASSIFICATION_PROMPT = """You classify JBoss EAP-like server logs for incident monitoring.
 Use only supplied log lines. Choose one category: NORMAL, THREAD_POOL, DATASOURCE_POOL,
@@ -19,12 +18,15 @@ Prefer a few relevant tool calls over querying everything blindly. Never ask for
 invent write operations. When evidence is sufficient, respond without more tool calls.
 """
 
+# 承認者が読む説明は日本語で生成し、処理に使う識別子は変えない。
 DIAGNOSIS_INSTRUCTIONS = """Produce a structured JBoss incident diagnosis using only the
 initial logs and read-only tool evidence. If evidence does not justify a safe action,
 use action type NONE. Do not fabricate current_value, proposed_value, or deployment_name.
 Use exactly one root_cause code when supported: THREAD_POOL_CONFIGURATION,
 DATASOURCE_POOL_EXHAUSTION, DEPLOYMENT_FAILURE, UNKNOWN.
 For a clearly observed recent configuration regression, prefer restoring the previous value.
+Write reason and recommended_action.rationale in Japanese for the human approval screen.
+Keep root_cause and action type codes, tool names, and deployment_name unchanged.
 """
 
 
@@ -50,9 +52,10 @@ def initial_investigation_messages(state: IncidentState) -> list[object]:
 
 
 def diagnosis_prompt(state: IncidentState) -> str:
-    evidence = "\n".join(
-        f"- {item.get('tool_name')}: {item.get('content')}" for item in state.get("evidence", [])
-    ) or "- No tool evidence captured"
+    evidence = (
+        "\n".join(f"- {item.get('tool_name')}: {item.get('content')}" for item in state.get("evidence", []))
+        or "- No tool evidence captured"
+    )
     logs = "\n".join(state.get("initial_log_lines", [])) or "(none)"
     return (
         f"{DIAGNOSIS_INSTRUCTIONS}\n\n"

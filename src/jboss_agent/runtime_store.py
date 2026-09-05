@@ -1,6 +1,6 @@
-"""Small SQLite store for dashboard metadata.
+"""ダッシュボード表示用の情報を SQLite に保存する。
 
-LangGraph State itself is stored separately by the LangGraph checkpointer.
+LangGraph の実行状態そのものは、別のチェックポインターで保存する。
 """
 
 from __future__ import annotations
@@ -8,13 +8,13 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 @dataclass(frozen=True)
@@ -237,7 +237,9 @@ class RuntimeStore:
 
     def list_incidents(self, *, limit: int = 20) -> list[IncidentRecord]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM incidents ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM incidents ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [_incident(row) for row in rows]
 
     def list_pending_approvals(self) -> list[IncidentRecord]:

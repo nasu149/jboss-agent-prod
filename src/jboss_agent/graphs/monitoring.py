@@ -1,4 +1,4 @@
-"""Monitoring Graph: read log delta -> classify -> create incident -> notify."""
+"""監視グラフ：ログ差分取得 → 分類 → 障害登録 → 通知。"""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def make_collect_logs_node(read_tools: Sequence[Any]):
         try:
             raw = await read_log.ainvoke({"server_id": state["server_id"], "cursor": previous})
         except Exception as exc:
-            # Demo log files can be reset. Treat a cursor beyond EOF like log rotation.
+            # ログ初期化でカーソルが末尾を超えた場合は、ローテーションと同様に扱う。
             if previous <= 0 or "beyond current log size" not in str(exc).lower():
                 raise
             previous = 0
@@ -131,6 +131,7 @@ def make_notify_node(notifier: Callable[[dict[str, object]], object] | None = No
 
 
 def _commit_cursor(state: MonitoringState) -> dict[str, object]:
+    # 次回の監視で同じログを再処理しないよう、読み取り位置を保存する。
     current = int(state.get("current_log_cursor", state.get("previous_log_cursor", 0)))
     return {
         "previous_log_cursor": current,
@@ -154,7 +155,7 @@ def build_monitoring_graph(
     classifier: LogClassifier | None = None,
     notifier: Callable[[dict[str, object]], object] | None = None,
 ):
-    """Build the durable graph used by the Streamlit Scan button."""
+    """Streamlit のスキャンボタンから使う、状態を永続化する監視グラフを構築する。"""
     resolved_classifier = classifier or build_log_classifier(settings)
 
     graph = StateGraph(MonitoringState)

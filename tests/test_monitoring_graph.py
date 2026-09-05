@@ -43,7 +43,7 @@ async def test_fixed_monitor_thread_persists_cursor_and_skips_llm_without_delta(
 
     @tool
     def read_server_log(server_id: str, cursor: int) -> dict[str, object]:
-        """Read fake log delta."""
+        """テスト用のログ差分を読み取る。"""
         return source.read(cursor)
 
     classifier = FakeClassifier()

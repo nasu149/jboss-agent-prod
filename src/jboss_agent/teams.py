@@ -1,4 +1,4 @@
-"""Local Teams notification tool. This integration intentionally is not MCP."""
+"""ローカルの Teams 通知ツール。MCP とは別の連携として実装する。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from jboss_agent.config import get_settings
-
 
 logger = logging.getLogger(__name__)
 Severity = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
@@ -50,7 +49,7 @@ def send_teams_alert(
     confidence: float,
     summary: str,
 ) -> str:
-    """Send one idempotent Teams incident notification."""
+    """同一障害の重複送信を抑止して Teams に通知する。"""
     alert = TeamsAlert(
         server_id=server_id,
         incident_id=incident_id,

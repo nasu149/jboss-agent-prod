@@ -1,4 +1,4 @@
-"""Gemini model construction used by both LangGraph workflows."""
+"""2つの LangGraph ワークフローで使用する Gemini モデルを生成する。"""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def build_log_classifier(settings: Settings) -> LogClassifier:
 
 
 def build_investigator(settings: Settings, read_tools: Sequence[Any]):
-    """The LLM receives read-only tools only."""
+    """LLM には読み取り専用ツールだけを渡す。"""
     return build_gemini(settings).bind_tools(list(read_tools))
 
 

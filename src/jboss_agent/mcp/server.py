@@ -1,4 +1,4 @@
-"""Fake JBoss MCP server exposing explicit capabilities over stdio."""
+"""Fake JBoss の個別操作を標準入出力経由で公開する MCP サーバー。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from mcp.server.fastmcp import FastMCP
 from jboss_agent.config import get_settings
 from jboss_agent.fake_jboss import FakeJBossOperations
 
-
+# ツールの docstring は LLM に公開する説明として使うため、英語で統一する。
 mcp = FastMCP("Fake JBoss Capability API")
 
 
@@ -16,7 +16,7 @@ def _ops() -> FakeJBossOperations:
     return FakeJBossOperations(settings.fake_jboss_data_dir, server_id=settings.server_id)
 
 
-# Read-only capabilities: these are the only tools bound to the investigation LLM.
+# 読み取り専用の操作: these are the only tools bound to the investigation LLM.
 @mcp.tool()
 def read_server_log(server_id: str, cursor: int) -> dict[str, object]:
     """Read server.log lines added after a byte cursor."""
@@ -53,8 +53,8 @@ def get_recent_config_changes(server_id: str) -> dict[str, object]:
     return _ops().get_recent_config_changes(server_id)
 
 
-# Write capabilities: never bound to the investigation LLM. Python selects one
-# only after policy validation + human approval.
+# 書き込みツールは調査用 LLM に渡さない。安全ルールと人の承認を通過してから、
+# Python が実行するツールを選ぶ。
 @mcp.tool()
 def set_thread_pool_max_threads(server_id: str, value: int) -> dict[str, object]:
     """Set worker max_threads after approval."""

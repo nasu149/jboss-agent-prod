@@ -1,5 +1,5 @@
 def test_sqlite_checkpointer_dependency_is_installed() -> None:
-    # Regression test for the missing dependency that previously broke the Streamlit app.
+    # 依存不足で Streamlit が起動できなくなる問題の再発を防ぐ。
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     assert AsyncSqliteSaver is not None
