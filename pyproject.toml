@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jboss-incident-agent"
+version = "1.0.0"
+description = "Minimal LangGraph + Gemini + MCP JBoss incident-response demo"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "langgraph>=1.1.5,<2",
+  "langgraph-checkpoint-sqlite>=3.1,<4",
+  "langchain-core>=1,<2",
+  "langchain-google-genai>=4,<5",
+  "langchain-mcp-adapters==0.3.2",
+  "mcp[cli]>=1.24,<2",
+  "streamlit>=1.45,<2",
+  "httpx>=0.28,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "python-dotenv>=1,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.11,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+ignore = ["EXE002"]  # 実行権限があるのにシバンがない警告を無視
