@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Sequence
 from typing import Any, Callable, Mapping
@@ -15,6 +14,7 @@ from jboss_agent.graphs.state import MonitoringState
 from jboss_agent.llm import LogClassifier, build_log_classifier
 from jboss_agent.models import LogClassification
 from jboss_agent.teams import send_teams_alert
+from jboss_agent.tool_results import normalize_tool_result
 
 
 def _tool(tools: Sequence[Any], name: str) -> Any:
@@ -23,20 +23,6 @@ def _tool(tools: Sequence[Any], name: str) -> Any:
             return candidate
     raise ValueError(f"required MCP tool not found: {name}")
 
-
-def _normalize(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    if hasattr(value, "content"):
-        return _normalize(value.content)
-    return {"raw": value}
 
 
 def _start_cycle(state: MonitoringState) -> dict[str, object]:
@@ -72,7 +58,7 @@ def make_collect_logs_node(read_tools: Sequence[Any]):
             cursor_reset = True
             raw = await read_log.ainvoke({"server_id": state["server_id"], "cursor": 0})
 
-        result = _normalize(raw)
+        result = normalize_tool_result(raw)
         lines = [str(line) for line in result.get("lines", [])]
         current = int(result.get("to_cursor", previous))
         return {
@@ -134,7 +120,7 @@ def make_notify_node(notifier: Callable[[dict[str, object]], object] | None = No
                 "summary": state["summary"],
             }
         )
-        result = _normalize(raw)
+        result = normalize_tool_result(raw)
         return {
             "teams_notified": bool(result.get("success")),
             "teams_tool_status": str(result.get("status", "unknown")),

@@ -62,3 +62,33 @@ async def test_fixed_monitor_thread_persists_cursor_and_skips_llm_without_delta(
     assert first["has_new_logs"] is True
     assert second["has_new_logs"] is False
     assert classifier.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_monitoring_accepts_mcp_content_block_output() -> None:
+    source = LogSource()
+
+    class McpStyleReadTool:
+        name = "read_server_log"
+
+        async def ainvoke(self, args: dict[str, object]) -> object:
+            payload = source.read(int(args["cursor"]))
+            return [{"type": "text", "text": json.dumps(payload)}]
+
+    classifier = FakeClassifier()
+    graph = build_monitoring_graph(
+        [McpStyleReadTool()],
+        checkpointer=InMemorySaver(),
+        settings=Settings(GOOGLE_API_KEY="test-key"),
+        classifier=classifier,
+        notifier=lambda payload: json.dumps({"success": True, "status": "test"}),
+    )
+
+    result = await graph.ainvoke(
+        {"server_id": "jboss-test"},
+        config={"configurable": {"thread_id": "monitor:mcp-content-block"}},
+    )
+
+    assert result["has_new_logs"] is True
+    assert result["new_log_lines"] == ["2026-09-05 INFO request completed"]
+    assert classifier.calls == 1

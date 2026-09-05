@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -18,25 +17,8 @@ from jboss_agent.graphs.state import IncidentState
 from jboss_agent.llm import build_diagnoser, build_investigator
 from jboss_agent.models import ApprovalResponse, IncidentDiagnosis
 from jboss_agent.policy import evaluate_action
+from jboss_agent.tool_results import normalize_tool_result
 
-
-def _normalize(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
-        text = value[0].get("text")
-        if isinstance(text, str):
-            return _normalize(text)
-    if hasattr(value, "content"):
-        return _normalize(value.content)
-    return {"raw": value}
 
 
 def _prepare_investigation(state: IncidentState) -> dict[str, object]:
@@ -229,7 +211,7 @@ def _capture_write(state: IncidentState) -> dict[str, object]:
         "execution_result": {
             "tool_name": message.name,
             "tool_call_id": message.tool_call_id,
-            "content": _normalize(message.content),
+            "content": normalize_tool_result(message.content),
         },
         "recovery_attempts": state.get("recovery_attempts", 0) + 1,
         "node_trace": [*state.get("node_trace", []), "capture_write"],
@@ -246,22 +228,22 @@ def make_verify_node(read_tools: Sequence[Any]):
     async def verify(state: IncidentState) -> dict[str, object]:
         server_id = state["server_id"]
         action_type = (state.get("proposed_action") or {}).get("type")
-        health = _normalize(await tools["get_server_health"].ainvoke({"server_id": server_id}))
+        health = normalize_tool_result(await tools["get_server_health"].ainvoke({"server_id": server_id}))
         details: dict[str, Any] = {"health": health}
         healthy = health.get("status") == "UP" and float(health.get("request_error_rate", 1.0)) < 0.05
 
         if action_type == "SET_THREAD_POOL_MAX_THREADS":
-            pool = _normalize(await tools["get_thread_pool_status"].ainvoke({"server_id": server_id}))
+            pool = normalize_tool_result(await tools["get_thread_pool_status"].ainvoke({"server_id": server_id}))
             details["thread_pool"] = pool
             healthy = healthy and int(pool.get("active_threads", 10**9)) <= int(pool.get("max_threads", -1))
             healthy = healthy and int(pool.get("queue_size", 1)) == 0 and int(pool.get("rejected_tasks", 1)) == 0
         elif action_type == "SET_DATASOURCE_MAX_POOL_SIZE":
-            ds = _normalize(await tools["get_datasource_status"].ainvoke({"server_id": server_id}))
+            ds = normalize_tool_result(await tools["get_datasource_status"].ainvoke({"server_id": server_id}))
             details["datasource"] = ds
             healthy = healthy and int(ds.get("active_count", 10**9)) <= int(ds.get("max_pool_size", -1))
             healthy = healthy and int(ds.get("timed_out_requests", 1)) == 0
         elif action_type == "RESTART_DEPLOYMENT":
-            deployment = _normalize(await tools["get_deployment_status"].ainvoke({"server_id": server_id}))
+            deployment = normalize_tool_result(await tools["get_deployment_status"].ainvoke({"server_id": server_id}))
             details["deployment"] = deployment
             healthy = healthy and deployment.get("status") == "OK" and bool(deployment.get("enabled"))
 

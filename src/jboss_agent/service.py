@@ -143,14 +143,23 @@ class AgentService:
     def _record_scan(self, state: dict[str, Any]) -> None:
         lines = len(state.get("new_log_lines", []))
         if not state.get("has_new_logs"):
-            message = "No new server.log lines; Gemini skipped"
+            message = (
+                f"No new server.log lines (cursor {state.get('scan_from_cursor', 0)} "
+                f"-> {state.get('current_log_cursor', 0)}); Gemini skipped"
+            )
         elif state.get("incident_detected"):
             message = (
-                f"{lines} new log lines analyzed; incident suspected: "
+                f"{lines} new log lines analyzed "
+                f"(cursor {state.get('scan_from_cursor', 0)} -> {state.get('current_log_cursor', 0)}); "
+                f"incident suspected: "
                 f"{state.get('category')} ({float(state.get('confidence', 0.0)):.0%})"
             )
         else:
-            message = f"{lines} new log lines analyzed; no incident detected"
+            message = (
+                f"{lines} new log lines analyzed "
+                f"(cursor {state.get('scan_from_cursor', 0)} -> {state.get('current_log_cursor', 0)}); "
+                "no incident detected"
+            )
         self.runtime.add_activity(self.settings.server_id, "monitoring", message)
 
     def _persist_incident(self, monitoring: dict[str, Any], result: dict[str, Any], thread_id: str) -> None:

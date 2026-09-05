@@ -743,3 +743,10 @@ Real JBoss Management API / JBoss CLI wrapper
 - observability / tracing
 
 このプロジェクトは、それらを載せる前の**Agent設計の最小骨格**として使う想定です。
+
+
+## Troubleshooting
+
+### `Gemini skipped` が続く場合
+
+**Inject Random Event** のあとに **Run scan now** を押してください。v1.0.1 では MCP content block の正規化を共通化し、注入後の新規ログを正しく検出できるよう修正しています。
