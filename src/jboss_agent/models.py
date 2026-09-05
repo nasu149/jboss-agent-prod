@@ -6,7 +6,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-
 IncidentCategory = Literal["NORMAL", "THREAD_POOL", "DATASOURCE_POOL", "DEPLOYMENT", "UNKNOWN"]
 RemediationActionType = Literal[
     "NONE",
