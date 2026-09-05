@@ -1,4 +1,9 @@
-"""2つの LangGraph ワークフローと UI をつなぐアプリケーションサービス。"""
+"""監視・障害対応の LangGraph と、画面用の永続データをつなぐサービス。
+
+グラフのチェックポイントは実行の継続・承認後の再開に使い、RuntimeStore は
+画面に表示する監視状態・障害一覧・活動履歴を保存する。正解データは障害 ID の
+関連付けにのみ使用し、診断の入力には含めない。
+"""
 
 from __future__ import annotations
 
@@ -17,13 +22,25 @@ from jboss_agent.simulator import GroundTruthStore
 
 
 class AgentService:
+    """監視の開始、障害対応の開始・再開、および UI 向けの結果保存をまとめる。"""
+
     def __init__(self, settings: Settings, runtime: RuntimeStore, truth: GroundTruthStore) -> None:
+        """設定、画面用ストア、答え合わせ用ストアを受け取って保持する。
+
+        ここではグラフや MCP 接続を作らず、操作の実行時に用意する。
+        """
         self.settings = settings
         self.runtime = runtime
         self.truth = truth
 
     async def run_scan(self) -> dict[str, Any]:
-        """監視を1回実行し、障害を検出した場合は調査・対応へ進む。"""
+        """監視を1回実行し、障害が見つかれば調査・対応グラフへ進む。
+
+        監視は固定の thread_id でログの読取位置を引き継ぎ、障害対応は障害ごとの
+        thread_id で保存する。戻り値は monitoring と incident の状態で、障害が
+        なければ incident は None。承認待ちによる中断も保存して正常に返す。
+        例外時は監視エラーを記録したうえで再送出し、呼び出し元に表示を任せる。
+        """
         server_id = self.settings.server_id
         self.runtime.begin_scan(server_id)
 
@@ -35,12 +52,14 @@ class AgentService:
                     checkpointer=checkpointer,
                     settings=self.settings,
                 )
+                # 監視用の固定スレッドを再利用し、前回確定したログカーソルを復元する。
                 monitoring = await monitoring_graph.ainvoke(
                     {"server_id": server_id},
                     config={"configurable": {"thread_id": self.settings.monitoring_thread_id}},
                 )
 
                 incident_id = monitoring.get("incident_id")
+                # 監視部分の完了を先に記録する。障害対応の完了・承認待ちは別途保存する。
                 self.runtime.complete_scan(
                     server_id,
                     previous_cursor=int(monitoring.get("scan_from_cursor", 0)),
@@ -53,6 +72,7 @@ class AgentService:
                     return {"monitoring": monitoring, "incident": None}
 
                 incident_id = str(incident_id)
+                # 障害ごとに実行状態を分離し、他の障害の承認再開と混ざらないようにする。
                 thread_id = f"incident:{incident_id}"
                 self.runtime.upsert_incident(
                     incident_id=incident_id,
@@ -108,6 +128,12 @@ class AgentService:
         decision: str,
         proposed_value: int | None = None,
     ) -> dict[str, Any]:
+        """保存された障害を、承認・拒否・値を編集した承認の判断で再開する。
+
+        incident_id に対応するチェックポイントへ decision と任意の proposed_value を
+        渡し、結果を画面用ストアにも保存して返す。未知の障害 ID は ValueError とする。
+        編集値の安全性検証と書き込み可否の判断は、再開先のグラフが担当する。
+        """
         record = self.runtime.get_incident(incident_id)
         if record is None:
             raise ValueError(f"unknown incident_id: {incident_id}")
@@ -130,6 +156,7 @@ class AgentService:
                 config={"configurable": {"thread_id": record.thread_id}},
             )
 
+        # 再開時は監視をやり直さず、障害レコードの基本情報を保存処理へ渡す。
         monitoring_stub = {
             "incident_id": record.incident_id,
             "server_id": record.server_id,
@@ -142,6 +169,7 @@ class AgentService:
         return result
 
     def _record_scan(self, state: dict[str, Any]) -> None:
+        """ログ差分の有無と障害検知結果を、監視の活動履歴として1件保存する。"""
         lines = len(state.get("new_log_lines", []))
         if not state.get("has_new_logs"):
             message = (
@@ -164,6 +192,12 @@ class AgentService:
         self.runtime.add_activity(self.settings.server_id, "monitoring", message)
 
     def _persist_incident(self, monitoring: dict[str, Any], result: dict[str, Any], thread_id: str) -> None:
+        """グラフの状態を画面用の障害レコードと活動履歴に変換して保存する。
+
+        中断、拒否、安全ルールによる中止、復旧結果の順に表示ステータスを決める。
+        monitoring は障害の基本情報、result はグラフの実行結果、thread_id は
+        承認後に同じ実行を再開するための識別子。
+        """
         incident_id = str(monitoring["incident_id"])
         pending = _interrupt_payload(result)
         proposed_action = result.get("proposed_action")
@@ -172,6 +206,7 @@ class AgentService:
         approval = result.get("approval_status")
         failure_reason = result.get("failure_reason")
 
+        # 承認待ちを最優先にし、途中の復旧結果から完了扱いにならないようにする。
         if pending is not None:
             status, activity = "PENDING_APPROVAL", "調査を一時停止し、復旧操作の承認を待っています"
         elif approval == "REJECTED":
@@ -217,6 +252,10 @@ class AgentService:
 
 
 def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
+    """最初の LangGraph 中断から承認用データを取り出し、辞書として返す。
+
+    中断がなければ None。value 属性を持つ中断オブジェクトにも、生の値にも対応する。
+    """
     interrupts = result.get("__interrupt__")
     if not interrupts:
         return None
@@ -226,6 +265,10 @@ def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _read_tool_names(messages: list[Any]) -> list[str]:
+    """AIMessage が要求した読み取りツール名を、重複を残して呼び出し順に返す。
+
+    実行結果ではなく要求メッセージを数えるため、成功した呼び出しの一覧ではない。
+    """
     names: list[str] = []
     for message in messages:
         if isinstance(message, AIMessage):

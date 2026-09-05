@@ -1,4 +1,8 @@
-"""LLM に任せる判断を確認しやすいよう、プロンプトを集約する。"""
+"""ログ分類・読み取り調査・構造化診断の3段階で使う LLM 向け入力を組み立てる。
+
+監視ログとツールで得た根拠を渡し、シミュレーターの正解は含めない。
+ここでは文字列とメッセージを作るだけで、モデルやツールの呼び出しは行わない。
+"""
 
 from __future__ import annotations
 
@@ -6,12 +10,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from jboss_agent.graphs.state import IncidentState
 
+# 監視段階では与えたログだけを分類させ、未取得のメトリクスや正解名の推測を抑える。
 LOG_CLASSIFICATION_PROMPT = """You classify JBoss EAP-like server logs for incident monitoring.
 Use only supplied log lines. Choose one category: NORMAL, THREAD_POOL, DATASOURCE_POOL,
 DEPLOYMENT, UNKNOWN. Set incident_detected=false for genuinely normal activity.
 Do not invent metrics, configuration values, or hidden scenario labels.
 """
 
+# 調査段階の行動指示。実際の読み取り限定はグラフ側で渡すツールも制限して実現する。
 INVESTIGATION_SYSTEM_PROMPT = """You are a JBoss incident investigator.
 You have READ-ONLY JBoss tools only. Use tool evidence before concluding.
 Prefer a few relevant tool calls over querying everything blindly. Never ask for or
@@ -31,10 +37,16 @@ Keep root_cause and action type codes, tool names, and deployment_name unchanged
 
 
 def log_classification_prompt(log_text: str) -> str:
+    """ログ差分を分類指示に付加し、監視用分類器に渡す文字列を返す。"""
     return f"{LOG_CLASSIFICATION_PROMPT}\n\nLOG LINES:\n{log_text}"
 
 
 def initial_investigation_messages(state: IncidentState) -> list[object]:
+    """読み取り限定の調査指示と、障害 ID・対象サーバー・初期ログの会話を作る。
+
+    監視の分類は手掛かりとして渡し、ツールで原因を調べるよう依頼する。
+    初期ログが空なら、ログが与えられていないことを明示する。
+    """
     logs = "\n".join(state.get("initial_log_lines", [])) or "(no initial logs supplied)"
     return [
         SystemMessage(content=INVESTIGATION_SYSTEM_PROMPT),
@@ -52,6 +64,12 @@ def initial_investigation_messages(state: IncidentState) -> list[object]:
 
 
 def diagnosis_prompt(state: IncidentState) -> str:
+    """初期ログと蓄積したツール根拠をまとめ、構造化診断用の入力文字列を返す。
+
+    ツール名と応答内容を列挙し、安全な操作を裏付けられない場合は NONE を促す。
+    人が読む提案理由は日本語、操作や原因の識別コードは固定の表記を要求する。
+    """
+    # 会話全体ではなく、状態に蓄積したツール名と応答を診断の根拠として提示する。
     evidence = (
         "\n".join(f"- {item.get('tool_name')}: {item.get('content')}" for item in state.get("evidence", []))
         or "- No tool evidence captured"

@@ -1,4 +1,8 @@
-"""デモの障害注入と、シミュレーター専用の正解情報の保存を行う。"""
+"""デモ用の疑似障害・正常イベントを投入し、答え合わせ用の正解を別 DB に保存する。
+
+Fake JBoss には観測可能な設定・メトリクス・ログだけを反映する。シナリオ名と
+障害 ID の対応は GroundTruthStore が管理し、エージェントの診断入力から分離する。
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ from typing import Literal
 from jboss_agent.fake_jboss import FakeJBossOperations
 from jboss_agent.runtime_store import utc_now_iso
 
+# 正常イベントも選択肢に含め、誤検知しないこともデモで確認できるようにする。
 Scenario = Literal[
     "THREAD_POOL_CONFIGURATION",
     "DATASOURCE_POOL_EXHAUSTION",
@@ -28,6 +33,10 @@ SCENARIOS: tuple[Scenario, ...] = (
 
 @dataclass(frozen=True)
 class GroundTruthEvent:
+    """投入したイベントの正解と、検出された障害への対応を表す変更不可のレコード。
+
+    injected_at は投入を記録した UTC 日時、linked_incident_id は未関連付けなら None。
+    """
     event_id: str
     server_id: str
     scenario: Scenario
@@ -36,9 +45,10 @@ class GroundTruthEvent:
 
 
 class GroundTruthStore:
-    """Agent が Fake JBoss の状態から正解を読めないよう、保存先を分離する。"""
+    """エージェントが読む疑似サーバー状態とは別の SQLite DB で正解を管理する。"""
 
     def __init__(self, path: str | Path) -> None:
+        """保存先の親ディレクトリと正解テーブルを、存在しない場合に作成する。"""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
@@ -55,12 +65,14 @@ class GroundTruthStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
+        """列名で行を参照できる SQLite 接続を開き、WAL モードを設定して返す。"""
         conn = sqlite3.connect(self.path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def record(self, event_id: str, server_id: str, scenario: Scenario) -> GroundTruthEvent:
+        """イベントの正解と現在の UTC 日時を保存し、未関連付けのレコードを返す。"""
         injected_at = utc_now_iso()
         with self._connect() as conn:
             conn.execute(
@@ -70,7 +82,12 @@ class GroundTruthStore:
         return GroundTruthEvent(event_id, server_id, scenario, injected_at, None)
 
     def link_latest_unlinked(self, server_id: str, incident_id: str) -> str | None:
+        """対象サーバーの最新の未関連付けイベントを障害 ID に結び、そのイベント ID を返す。
+
+        対応候補は投入日時で選び、ログ内容との照合は行わない。候補がなければ None。
+        """
         with self._connect() as conn:
+            # 未関連付けの最新イベントを対応候補とする、デモ用の簡易的な関連付け。
             row = conn.execute(
                 """
                 SELECT event_id FROM ground_truth_events
@@ -89,11 +106,13 @@ class GroundTruthStore:
             return event_id
 
     def get(self, event_id: str) -> GroundTruthEvent | None:
+        """イベント ID で正解レコードを取得する。見つからなければ None を返す。"""
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM ground_truth_events WHERE event_id=?", (event_id,)).fetchone()
         return _event(row) if row else None
 
     def latest(self, server_id: str) -> GroundTruthEvent | None:
+        """対象サーバーで投入日時が最新の正解レコードを返す。未投入なら None。"""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM ground_truth_events WHERE server_id=? ORDER BY injected_at DESC LIMIT 1",
@@ -103,20 +122,30 @@ class GroundTruthStore:
 
 
 class FaultInjector:
+    """疑似サーバーにシナリオの兆候を作り、正解を専用ストアへ記録する。"""
+
     def __init__(self, fake: FakeJBossOperations, truth: GroundTruthStore) -> None:
+        """変更対象の Fake JBoss と、正解を記録するストアを保持する。"""
         self.fake = fake
         self.truth = truth
 
     def inject_random(self) -> GroundTruthEvent:
+        """正常系を含む SCENARIOS からランダムに1つを投入し、正解レコードを返す。"""
         return self.inject(random.SystemRandom().choice(SCENARIOS))
 
     def inject(self, scenario: Scenario) -> GroundTruthEvent:
+        """指定シナリオの設定・負荷・ログを作り、投入したイベントの正解レコードを返す。
+
+        先に設定とメトリクスを正常値へ戻し、前の障害の影響を除く。ログは消さず追記し、
+        監視カーソルを維持する。未対応のシナリオは ValueError とする。
+        """
         event_id = f"evt-{uuid.uuid4().hex[:10]}"
         self.fake.ensure_initialized()
         # 各シナリオを独立して試せるよう、メトリクスと設定だけを初期化する。
         # 監視カーソルを維持するため、server.log は追記された状態を保つ。
         self.fake.restore_baseline_state()
 
+        # 上限を小さくした変更履歴と負荷を作り、以前の設定へ戻す根拠を残す。
         if scenario == "THREAD_POOL_CONFIGURATION":
             self.fake.set_thread_pool_max_threads(self.fake.server_id, 20)
             self.fake.simulate_thread_pool_load(
@@ -148,6 +177,7 @@ class FaultInjector:
                     "2026-09-05 18:22:03 WARN  [org.example.health] readiness check returned 503",
                 ]
             )
+        # 正常系は初期化後のメトリクスを維持し、成功ログだけを追加する。
         elif scenario == "NORMAL_ACTIVITY":
             self.fake.append_log_lines(
                 [
@@ -159,10 +189,15 @@ class FaultInjector:
         else:  # pragma: no cover
             raise ValueError(f"unsupported scenario: {scenario}")
 
+        # 投入が完了してから正解を別 DB に保存する。Fake JBoss にはシナリオ名を書かない。
         return self.truth.record(event_id, self.fake.server_id, scenario)
 
 
 def normalize_diagnosis(value: str | None) -> str | None:
+    """診断名の大小文字・区切り文字・既知の別名を、答え合わせ用に正規化する。
+
+    空の入力は None、別名表にない値は文字表記だけを正規化して返す。
+    """
     if not value:
         return None
     text = value.strip().upper().replace("-", "_").replace(" ", "_")
@@ -176,6 +211,7 @@ def normalize_diagnosis(value: str | None) -> str | None:
 
 
 def _event(row: sqlite3.Row) -> GroundTruthEvent:
+    """SQLite の行を、画面やサービスが扱う GroundTruthEvent に変換する。"""
     return GroundTruthEvent(
         event_id=row["event_id"],
         server_id=row["server_id"],

@@ -1,4 +1,10 @@
-"""JBoss 障害対応デモの Streamlit 起動モジュール。"""
+"""JBoss 障害対応デモの画面表示とユーザー操作を担当する Streamlit アプリ。
+
+サーバー状態の確認、疑似イベントの投入、監視の実行、復旧操作の承認、結果の
+答え合わせを提供する。監視・復旧ワークフローの実行は AgentService に委譲する。
+Streamlit は操作のたびにこのファイルを上から再実行するため、処理結果は
+永続ストアから読み直し、画面セッション固有の情報は st.session_state に保持する。
+"""
 
 from __future__ import annotations
 
@@ -19,11 +25,15 @@ from jboss_agent.simulator import (
     normalize_diagnosis,
 )
 
+# 設定と永続ストアを用意する。runtime は監視・障害・活動履歴、truth は
+# 答え合わせ用の正解データを扱い、正解はエージェントの診断入力に含めない。
 settings = get_settings()
 runtime = RuntimeStore(settings.runtime_db_path)
 truth = GroundTruthStore(settings.simulator_db_path)
 fake = FakeJBossOperations(settings.fake_jboss_data_dir, server_id=settings.server_id)
+# 再実行時に既存の状態をリセットせず、未作成の状態ファイルとログだけを初期化する。
 fake.ensure_initialized()
+# 疑似イベントの投入と、監視・復旧ワークフローの実行をそれぞれ専用クラスに任せる。
 injector = FaultInjector(fake, truth)
 service = AgentService(settings, runtime, truth)
 
@@ -34,6 +44,11 @@ def run_async(coro: Any) -> Any:
 
 
 def run_agent_action(coro: Any, label: str) -> bool:
+    """非同期のエージェント操作を実行し、進行中の表示と例外処理を共通化する。
+
+    coro は実行するコルーチン、label はスピナーに表示する説明。
+    例外なく終了した場合は True、例外を画面に表示した場合は False を返す。
+    この戻り値は操作の実行成否を表し、障害が復旧したかどうかは表さない。"""
     try:
         with st.spinner(label):
             run_async(coro)
@@ -44,10 +59,14 @@ def run_agent_action(coro: Any, label: str) -> bool:
 
 
 def terminal(record: IncidentRecord) -> bool:
+    """障害が調査中・承認待ちを抜け、答え合わせ可能な状態かを返す。
+
+    復旧成功に限らず、拒否や安全ルールによる中止なども終了状態として扱う。"""
     return record.status not in {"INVESTIGATING", "PENDING_APPROVAL"}
 
 
 def render_sidebar() -> None:
+    """デモの操作手順と、モデル・対象サーバー・通知モードの設定を表示する。"""
     with st.sidebar:
         st.header("How to try it")
         st.markdown(
@@ -64,6 +83,7 @@ def render_sidebar() -> None:
 
 
 def render_server_snapshot() -> None:
+    """Fake JBoss の現在の稼働状態、エラー率、リソース使用量を取得して表示する。"""
     health = fake.get_server_health(settings.server_id)
     thread_pool = fake.get_thread_pool_status(settings.server_id)
     datasource = fake.get_datasource_status(settings.server_id)
@@ -89,6 +109,7 @@ def render_server_snapshot() -> None:
 
 
 def render_monitoring_status() -> None:
+    """永続ストアから監視状態、ログの読取位置、最終スキャン日時とエラーを表示する。"""
     status = runtime.get_monitoring_status(settings.server_id)
     st.subheader("Monitoring state")
     cols = st.columns(4)
@@ -101,6 +122,11 @@ def render_monitoring_status() -> None:
 
 
 def render_controls() -> None:
+    """監視を一度実行するボタンと、疑似イベントを投入するボタンを表示する。
+
+    監視には API キーが必要。イベント投入時は正解の参照 ID をセッションに保存し、
+    活動履歴には正解を含めずに投入の事実を記録する。"""
+    # 承認対象のサーバー状態を別のイベントで上書きしないよう、承認待ち中は投入を無効にする。
     pending = runtime.list_pending_approvals()
     st.subheader("Controls")
     left, right = st.columns(2)
@@ -111,6 +137,7 @@ def render_controls() -> None:
         use_container_width=True,
         disabled=not settings.has_google_api_key,
     ):
+        # 監視から必要に応じて障害調査へ進む。成功後は先に描画した状態表示も更新する。
         if run_agent_action(service.run_scan(), "Running Monitoring Graph..."):
             st.rerun()
 
@@ -143,6 +170,10 @@ def render_controls() -> None:
 
 
 def render_approvals() -> None:
+    """承認待ちの復旧案を表示し、ユーザーの判断で停止中のワークフローを再開する。
+
+    操作内容・リスク・提案理由を示し、承認、拒否、整数の提案値を編集した承認を
+    受け付ける。再開処理が例外なく終了したら、画面全体を最新の状態で描画し直す。"""
     pending = runtime.list_pending_approvals()
     st.subheader("復旧操作の承認")
     if not pending:
@@ -180,6 +211,8 @@ def render_approvals() -> None:
                 c3.write("対象: サーバー全体")
             st.write("提案理由: " + (payload.get("reason") or "理由は提示されていません。"))
 
+            # 障害ごとに固有の key を付け、複数の承認欄があってもボタンを区別する。
+            # 判断結果はサービス経由で、保存された承認待ちワークフローに渡す。
             approve, reject = st.columns(2)
             if approve.button(
                 "承認して実行",
@@ -229,6 +262,7 @@ def render_approvals() -> None:
 
 
 def render_incidents() -> None:
+    """直近 20 件の障害について、対応状況・診断分類・重要度・復旧結果などを一覧表示する。"""
     incidents = runtime.list_incidents(limit=20)
     st.subheader("Incidents")
     if not incidents:
@@ -264,6 +298,10 @@ def render_incidents() -> None:
 
 
 def ground_truth_is_revealable(event: GroundTruthEvent) -> bool:
+    """疑似イベントの正解を画面に公開できるかを判定する。
+
+    障害に紐づく場合は、その障害が終了状態になるまで待つ。
+    紐づく障害がない場合は、最終スキャン日時がイベント投入日時以降かで判定する。"""
     if event.linked_incident_id:
         record = runtime.get_incident(event.linked_incident_id)
         return bool(record and terminal(record))
@@ -272,6 +310,10 @@ def ground_truth_is_revealable(event: GroundTruthEvent) -> bool:
 
 
 def render_ground_truth() -> None:
+    """公開条件を満たした疑似イベントについて、診断と復旧結果の答え合わせを表示する。
+
+    このセッションで最後に投入したイベントを優先し、参照 ID がなければ対象サーバーの
+    最新イベントを使う。障害が作成されなかった場合は、正常イベントか検知漏れかを示す。"""
     st.subheader("Demo answer check")
     event_id = st.session_state.get("last_injected_event_id")
     event = truth.get(event_id) if event_id else truth.latest(settings.server_id)
@@ -287,6 +329,7 @@ def render_ground_truth() -> None:
         record = runtime.get_incident(event.linked_incident_id)
         if record is None:
             return
+        # 診断の表記揺れをシナリオ名に正規化してから、投入した正解と照合する。
         actual = normalize_diagnosis((record.diagnosis or {}).get("root_cause"))
         st.write(f"Agent diagnosis: **{actual or 'N/A'}**")
         st.write(f"Diagnosis: **{'Correct' if actual == event.scenario else 'Incorrect'}**")
@@ -297,11 +340,13 @@ def render_ground_truth() -> None:
 
 
 def render_activity() -> None:
+    """対象サーバーの直近 80 件の活動履歴を、古いものから順に表示する。"""
     rows = runtime.list_activity(settings.server_id, limit=80)
     st.subheader("Agent activity timeline")
     if not rows:
         st.info("No activity yet.")
         return
+    # ストアは新しい順に返すため、表示時は処理の流れを追えるよう古い順に並べる。
     rows.reverse()
     st.dataframe(
         [
@@ -318,13 +363,16 @@ def render_activity() -> None:
     )
 
 
+# ここから画面の組み立て。Streamlit により、初回表示時とユーザー操作時に実行される。
 st.set_page_config(page_title="JBoss Incident Agent", page_icon="🧭", layout="wide")
 st.title("JBoss Incident Response Agent")
 st.caption("LangGraph + Gemini + MCP + Human-in-the-loop, with a local Fake JBoss backend")
 
+# キー未設定でも状態や履歴は表示し、API を使うスキャンボタンは render_controls で無効にする。
 if not settings.has_google_api_key:
     st.error("GOOGLE_API_KEY is not configured. Copy `.env.example` to `.env` and set your Gemini API key.")
 
+# 操作に必要な状態とコントロールを先に、承認・障害一覧・答え合わせ・活動履歴を後に配置する。
 render_sidebar()
 render_server_snapshot()
 render_monitoring_status()
