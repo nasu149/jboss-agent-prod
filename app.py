@@ -52,9 +52,12 @@ async def invoke_graph(resume: bool | None = None) -> dict[str, Any]:
         settings=settings,
     )
     config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+    print_mode = ["values", "updates"] if settings.langgraph_debug else []
     if resume is None:
-        return await graph.ainvoke({"server_id": settings.server_id, "trace": []}, config=config)
-    return await graph.ainvoke(Command(resume=resume), config=config)
+        return await graph.ainvoke(
+            {"server_id": settings.server_id, "trace": []}, config=config, print_mode=print_mode
+        )
+    return await graph.ainvoke(Command(resume=resume), config=config, print_mode=print_mode)
 
 
 def interrupt_payload(result: dict[str, Any] | None) -> dict[str, Any] | None:

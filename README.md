@@ -324,6 +324,15 @@ Copy-Item .env.example .env
 GOOGLE_API_KEY=your-api-key
 ```
 
+各ステップ後の State 全体と、ノード名・更新内容をターミナルに出力する場合は、
+`.env` に以下を追加します。未設定または `false` の場合は出力しません。
+
+```env
+LANGGRAPH_DEBUG=true
+```
+
+開始時と承認・拒否後の再開時の両方に適用されます。設定変更後はアプリを再起動してください。
+
 VS Code で `Dev Containers: Reopen in Container` を実行後、アプリを起動します。
 
 ```bash

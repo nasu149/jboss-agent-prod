@@ -256,7 +256,7 @@ def propose_thread_pool(state: AgentState) -> dict[str, object]:
         "proposed_action": {
             "tool": "set_thread_pool_max_threads",
             "args": {"server_id": state["server_id"], "value": 80},
-            "description": "thread pool の max_threads を 80 に戻す",
+            "description": "thread pool の max_threads を 80 にする",
         },
         "trace": [*state.get("trace", []), "propose_thread_pool"],
     }
@@ -268,7 +268,7 @@ def propose_datasource(state: AgentState) -> dict[str, object]:
         "proposed_action": {
             "tool": "set_datasource_max_pool_size",
             "args": {"server_id": state["server_id"], "value": 30},
-            "description": "datasource の max_pool_size を 30 に戻す",
+            "description": "datasource の max_pool_size を 30 にする",
         },
         "trace": [*state.get("trace", []), "propose_datasource"],
     }
@@ -360,8 +360,7 @@ def make_verify_node(read_tools: Sequence[Any]):
         elif category == "DATASOURCE_POOL_EXHAUSTION":
             result = as_dict(await datasource_tool.ainvoke({"server_id": server_id}))
             recovered = (
-                int(result.get("max_pool_size", 0)) >= 30
-                and int(result.get("timed_out_requests", 1)) == 0
+                int(result.get("max_pool_size", 0)) >= 30 and int(result.get("timed_out_requests", 1)) == 0
             )
         else:
             result = as_dict(await deployment_tool.ainvoke({"server_id": server_id}))

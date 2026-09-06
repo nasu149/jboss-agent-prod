@@ -23,6 +23,7 @@ class Settings:
     fake_jboss_data_dir: str
     teams_webhook_url: str = ""
     teams_dry_run: bool = True
+    langgraph_debug: bool = False
 
     @property
     def has_google_api_key(self) -> bool:
@@ -49,4 +50,5 @@ def get_settings() -> Settings:
         fake_jboss_data_dir=os.getenv("FAKE_JBOSS_DATA_DIR", ".data/fake_jboss"),
         teams_webhook_url=os.getenv("TEAMS_WEBHOOK_URL", ""),
         teams_dry_run=_env_bool("TEAMS_DRY_RUN", True),
+        langgraph_debug=_env_bool("LANGGRAPH_DEBUG", False),
     )
