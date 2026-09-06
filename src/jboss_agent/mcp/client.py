@@ -9,6 +9,8 @@ from typing import Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+from jboss_agent.config import get_settings
+
 READ_TOOLS = frozenset(
     {"read_server_log", "get_thread_pool_status", "get_datasource_status", "get_deployment_status"}
 )
@@ -18,13 +20,22 @@ WRITE_TOOLS = frozenset(
 
 
 def build_mcp_client() -> MultiServerMCPClient:
-    """別 Python プロセスの MCP サーバーへ stdio で接続するクライアントを作る。"""
+    """別 Python プロセスの MCP サーバーへ stdio で接続するクライアントを作る。
+
+    stdio 子プロセスには Fake JBoss が必要とする設定だけを明示的に渡す。
+    Gemini API Key は MCP サーバーには不要なので渡さず、プロセス境界を分かりやすく保つ。
+    """
+    settings = get_settings()
     return MultiServerMCPClient(
         {
             "fake_jboss": {
                 "transport": "stdio",
                 "command": sys.executable,
                 "args": ["-m", "jboss_agent.mcp.server"],
+                "env": {
+                    "FAKE_JBOSS_DATA_DIR": settings.fake_jboss_data_dir,
+                    "SERVER_ID": settings.server_id,
+                },
             }
         }
     )
