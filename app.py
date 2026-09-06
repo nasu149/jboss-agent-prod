@@ -110,11 +110,12 @@ if left.button("1. このシナリオを投入", use_container_width=True):
     reset_learning_run()
     st.success(f"{scenario} を投入しました。")
 
+already_ran = st.session_state.get("result") is not None
 if right.button(
     "2. Agent を実行",
     type="primary",
     use_container_width=True,
-    disabled=not settings.has_google_api_key,
+    disabled=not settings.has_google_api_key or already_ran,
 ):
     execute()
 

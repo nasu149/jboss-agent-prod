@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import os
+
 from mcp.server.fastmcp import FastMCP
 
-from jboss_agent.config import get_settings
 from jboss_agent.fake_jboss import FakeJBoss
 
 mcp = FastMCP("Fake JBoss")
 
 
 def _jboss() -> FakeJBoss:
-    settings = get_settings()
-    return FakeJBoss(settings.fake_jboss_data_dir, settings.server_id)
+    """親プロセスから明示的に渡された最小設定だけで Fake JBoss を開く。"""
+    return FakeJBoss(
+        os.getenv("FAKE_JBOSS_DATA_DIR", ".data/fake_jboss"),
+        os.getenv("SERVER_ID", "jboss-01"),
+    )
 
 
 @mcp.tool()
