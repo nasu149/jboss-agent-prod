@@ -73,7 +73,7 @@ def execute(resume: bool | None = None) -> None:
     try:
         with st.spinner("LangGraph を実行中..."):
             st.session_state["result"] = run_async(invoke_graph(resume))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - UI boundary: show model/MCP errors to the learner.
         st.error(f"実行に失敗しました: {exc}")
 
 

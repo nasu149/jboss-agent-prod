@@ -11,8 +11,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any, Literal, Mapping, TypedDict
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, TypedDict
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
@@ -218,7 +218,7 @@ def approval(state: AgentState) -> dict[str, object]:
         }
     )
     if not isinstance(decision, bool):
-        raise ValueError("resume value must be True (approve) or False (reject)")
+        raise TypeError("resume value must be True (approve) or False (reject)")
     return {
         "approved": decision,
         "trace": [*state.get("trace", []), "approval"],
@@ -244,7 +244,7 @@ def make_execute_node(write_tools: Sequence[Any]):
             raise ValueError(f"unsupported write tool: {name}")
         args = action.get("args")
         if not isinstance(args, dict):
-            raise ValueError("write tool args must be a dict")
+            raise TypeError("write tool args must be a dict")
         result = as_dict(await tool_map[name].ainvoke(args))
         return {
             "execution_result": result,
