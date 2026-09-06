@@ -1,26 +1,30 @@
-"""学習ポイントだけを残した 1 本の LangGraph。
+"""JBoss 障害一次対応を題材にした、1 本の LangGraph。
 
-このファイルで確認したいのは次の 3 点だけ。
+処理の中心は次の 4 点。
+1. server.log を Gemini が分類し、Conditional Edge で障害/正常を分ける。
+2. 障害時は Gemini 自身が read-only MCP Tool を選び、ToolNode が実行する。
+3. JBoss への write は Human-in-the-loop の承認後だけ Python が実行する。
+4. 障害検知時は LangGraph の通常 Node から Teams へ通知する。
 
-1. Gemini の分類結果を State に入れ、Conditional Edge で処理を分岐する。
-2. 分岐先の Node から JBoss の MCP read Tool を呼ぶ。
-3. write Tool の直前で ``interrupt()`` し、人が承認した場合だけ再開・実行する。
-
-監視 cursor、DB への Incident 記録、再試行、複雑な Policy などは意図的に持たない。
+監視スケジューラや複数 Incident の永続管理は持たず、1 人が 1 回の障害対応を
+コードで追いやすい構成を優先する。
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import Any, Literal, TypedDict
+from collections.abc import Callable, Mapping, Sequence
+from typing import Annotated, Any, Literal, TypedDict
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import END, START, StateGraph, add_messages
+from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from jboss_agent.config import Settings
 from jboss_agent.mcp.client import as_dict, by_name
+from jboss_agent.teams import send_teams_alert
 
 Category = Literal[
     "THREAD_POOL_CONFIGURATION",
@@ -31,25 +35,28 @@ Category = Literal[
 
 
 class LogAnalysis(BaseModel):
-    """Gemini に返させる最小限の Structured Output。"""
+    """Gemini に返させる最小限のログ分類結果。"""
 
     category: Category = Field(description="Most likely category represented by the log")
     summary: str = Field(description="Short reason for the classification")
 
 
 class AgentState(TypedDict, total=False):
-    """Graph の Node 間で受け渡す状態。
+    """Graph の Node 間で共有する State。
 
-    ``trace`` を見ると、どの Node をどの順番で通ったかを学習画面から確認できる。
-    ``proposed_action`` は LLM ではなく分岐先 Node が固定形式で作るため、write Tool の
-    名前や引数を LLM が自由生成する構造にはしていない。
+    ``messages`` は ToolNode が利用する会話履歴で、``add_messages`` reducer により
+    HumanMessage / AIMessage / ToolMessage が順に蓄積される。write Tool は messages に
+    含めず、Human approval 後に ``proposed_action`` を Python が直接実行する。
     """
 
     server_id: str
     log_lines: list[str]
     category: Category
     summary: str
+    messages: Annotated[list[Any], add_messages]
+    selected_read_tools: list[str]
     evidence: dict[str, Any]
+    teams_result: dict[str, Any]
     proposed_action: dict[str, Any] | None
     approved: bool
     execution_result: dict[str, Any]
@@ -58,25 +65,45 @@ class AgentState(TypedDict, total=False):
     trace: list[str]
 
 
-def build_classifier(settings: Settings) -> Any:
-    """ログ分類だけを担当する Gemini Structured Output client を作る。"""
+def build_gemini(settings: Settings) -> ChatGoogleGenerativeAI:
+    """分類と read Tool 選択で共通利用する Gemini client を作る。"""
     if not settings.has_google_api_key:
         raise RuntimeError("GOOGLE_API_KEY is not configured. Copy .env.example to .env and set it.")
 
-    model = ChatGoogleGenerativeAI(
+    return ChatGoogleGenerativeAI(
         model=settings.gemini_model,
         api_key=settings.google_api_key,
         temperature=0,
         timeout=30,
         max_retries=2,
     )
-    return model.with_structured_output(schema=LogAnalysis.model_json_schema(), method="json_schema")
+
+
+def build_classifier(settings: Settings) -> Any:
+    """ログ分類用の Structured Output client を作る。"""
+    return build_gemini(settings).with_structured_output(
+        schema=LogAnalysis.model_json_schema(),
+        method="json_schema",
+    )
+
+
+def build_investigator(settings: Settings, read_tools: Sequence[Any]) -> Any:
+    """詳細調査用 Gemini に read-only MCP Tool だけを bind する。
+
+    ``read_server_log`` は Graph の入口で固定実行済みなので除外し、Gemini には
+    thread pool / datasource / deployment の状態確認 Tool から 1 つを選ばせる。
+    ``tool_choice="any"`` により、調査 Node では Tool Call を必須にする。
+    """
+    diagnostic_tools = [tool for tool in read_tools if tool.name != "read_server_log"]
+    if not diagnostic_tools:
+        raise ValueError("at least one diagnostic read tool is required")
+    return build_gemini(settings).bind_tools(diagnostic_tools, tool_choice="any")
 
 
 def _classification_prompt(lines: list[str]) -> str:
-    """4 種類のどれに分けるかだけを Gemini に依頼する簡潔な Prompt を返す。"""
+    """4 種類のどれに分けるかだけを Gemini に依頼する Prompt を返す。"""
     log_text = "\n".join(lines)
-    return f"""You are classifying a tiny educational JBoss incident demo.
+    return f"""You are classifying a small educational JBoss incident demo.
 Choose exactly one category:
 - THREAD_POOL_CONFIGURATION
 - DATASOURCE_POOL_EXHAUSTION
@@ -91,7 +118,7 @@ server.log:
 
 
 def make_read_log_node(read_tools: Sequence[Any]):
-    """MCP ``read_server_log`` Tool を捕捉した Node を返す。"""
+    """MCP ``read_server_log`` Tool を固定で呼ぶ入口 Node を返す。"""
     tool = by_name(read_tools, "read_server_log")
 
     async def read_log(state: AgentState) -> dict[str, object]:
@@ -106,10 +133,10 @@ def make_read_log_node(read_tools: Sequence[Any]):
 
 
 def make_classify_node(classifier: Any):
-    """分類用 LLM を捕捉し、結果を State に書き込む Node を返す。"""
+    """Gemini の分類結果を State に書き込む Node を返す。"""
 
     def classify(state: AgentState) -> dict[str, object]:
-        """Gemini の Structured Output を検証し、category と summary を保存する。"""
+        """Structured Output を検証し、category と summary を保存する。"""
         raw = classifier.invoke(_classification_prompt(state.get("log_lines", [])))
         if isinstance(raw, LogAnalysis):
             result = raw
@@ -127,73 +154,140 @@ def make_classify_node(classifier: Any):
     return classify
 
 
+def route_after_classification(state: AgentState) -> str:
+    """正常ログは終了系へ、3 種類の障害は通知・調査系へ送る。"""
+    return "normal" if state["category"] == "NORMAL_ACTIVITY" else "incident"
+
+
+def make_notify_teams_node(
+    settings: Settings,
+    notifier: Callable[[str, str, str], dict[str, Any]] | None = None,
+):
+    """障害分類結果を Teams へ送る通常の LangGraph Node を返す。
+
+    Teams 通知は MCP Tool ではない。Graph の中に普通の Python Node として置くことで、
+    LLM が選ぶ MCP Tool と、Graph が明示的に実行する外部連携を分ける。
+    """
+    send = notifier or (
+        lambda server_id, category, summary: send_teams_alert(
+            settings,
+            server_id=server_id,
+            category=category,
+            summary=summary,
+        )
+    )
+
+    def notify(state: AgentState) -> dict[str, object]:
+        """server/category/summary を Teams へ送り、送信結果を State に残す。"""
+        result = send(state["server_id"], state["category"], state.get("summary", ""))
+        return {
+            "teams_result": result,
+            "trace": [*state.get("trace", []), "notify_teams"],
+        }
+
+    return notify
+
+
+def prepare_investigation(state: AgentState) -> dict[str, object]:
+    """Gemini が read Tool を選ぶための調査依頼を messages に追加する。"""
+    prompt = f"""Investigate this JBoss incident.
+
+Server: {state["server_id"]}
+Category: {state["category"]}
+Classification summary: {state.get("summary", "")}
+
+server.log:
+{chr(10).join(state.get("log_lines", []))}
+
+Choose exactly ONE bound read-only tool that is most useful for this category.
+Call that tool with server_id={state["server_id"]}.
+Do not propose or execute any write operation.
+"""
+    return {
+        "messages": [HumanMessage(content=prompt)],
+        "trace": [*state.get("trace", []), "prepare_investigation"],
+    }
+
+
+def make_investigate_node(investigator: Any):
+    """read Tool を bind した Gemini に、実際の Tool Call を選ばせる Node を返す。"""
+
+    async def investigate(state: AgentState) -> dict[str, object]:
+        """messages を Gemini に渡し、Tool Call を含む AIMessage を State に追加する。"""
+        response = await investigator.ainvoke(state.get("messages", []))
+        if not isinstance(response, AIMessage):
+            raise TypeError(f"investigator returned unsupported type: {type(response).__name__}")
+        if not response.tool_calls:
+            raise RuntimeError("investigator did not choose a read tool")
+        return {
+            "messages": [response],
+            "trace": [*state.get("trace", []), "investigate"],
+        }
+
+    return investigate
+
+
+def capture_tool_evidence(state: AgentState) -> dict[str, object]:
+    """ToolNode が追加した ToolMessage を evidence に変換する。
+
+    ToolNode 自体は ``trace`` を更新しないため、この Node で ``read_tools`` を追記し、
+    画面上でも ToolNode を通過したことが分かるようにする。
+    """
+    tool_messages = [message for message in state.get("messages", []) if isinstance(message, ToolMessage)]
+    if not tool_messages:
+        raise RuntimeError("ToolNode produced no ToolMessage")
+
+    evidence = {str(message.name): as_dict(message) for message in tool_messages}
+    return {
+        "selected_read_tools": list(evidence),
+        "evidence": evidence,
+        "trace": [*state.get("trace", []), "read_tools"],
+    }
+
+
 def route_category(state: AgentState) -> str:
-    """LLM が State に書いた category を Conditional Edge の分岐名へ変換する。"""
+    """分類済み category を、固定対処案を作る Node 名へ分岐させる。"""
     return state["category"]
 
 
-def make_thread_pool_node(read_tools: Sequence[Any]):
-    """thread pool の read Tool を呼び、デモ用の固定対処案を作る Node を返す。"""
-    tool = by_name(read_tools, "get_thread_pool_status")
-
-    async def inspect(state: AgentState) -> dict[str, object]:
-        """現在値を根拠として読み、max_threads を baseline の 80 に戻す案を作る。"""
-        evidence = as_dict(await tool.ainvoke({"server_id": state["server_id"]}))
-        return {
-            "evidence": evidence,
-            "proposed_action": {
-                "tool": "set_thread_pool_max_threads",
-                "args": {"server_id": state["server_id"], "value": 80},
-                "description": "thread pool の max_threads を 80 に戻す",
-            },
-            "trace": [*state.get("trace", []), "inspect_thread_pool"],
-        }
-
-    return inspect
+def propose_thread_pool(state: AgentState) -> dict[str, object]:
+    """Thread Pool 障害の固定対処案を作る。"""
+    return {
+        "proposed_action": {
+            "tool": "set_thread_pool_max_threads",
+            "args": {"server_id": state["server_id"], "value": 80},
+            "description": "thread pool の max_threads を 80 に戻す",
+        },
+        "trace": [*state.get("trace", []), "propose_thread_pool"],
+    }
 
 
-def make_datasource_node(read_tools: Sequence[Any]):
-    """datasource の read Tool を呼び、デモ用の固定対処案を作る Node を返す。"""
-    tool = by_name(read_tools, "get_datasource_status")
-
-    async def inspect(state: AgentState) -> dict[str, object]:
-        """現在値を根拠として読み、max_pool_size を baseline の 30 に戻す案を作る。"""
-        evidence = as_dict(await tool.ainvoke({"server_id": state["server_id"]}))
-        return {
-            "evidence": evidence,
-            "proposed_action": {
-                "tool": "set_datasource_max_pool_size",
-                "args": {"server_id": state["server_id"], "value": 30},
-                "description": "datasource の max_pool_size を 30 に戻す",
-            },
-            "trace": [*state.get("trace", []), "inspect_datasource"],
-        }
-
-    return inspect
+def propose_datasource(state: AgentState) -> dict[str, object]:
+    """Datasource 障害の固定対処案を作る。"""
+    return {
+        "proposed_action": {
+            "tool": "set_datasource_max_pool_size",
+            "args": {"server_id": state["server_id"], "value": 30},
+            "description": "datasource の max_pool_size を 30 に戻す",
+        },
+        "trace": [*state.get("trace", []), "propose_datasource"],
+    }
 
 
-def make_deployment_node(read_tools: Sequence[Any]):
-    """deployment の read Tool を呼び、再起動案を作る Node を返す。"""
-    tool = by_name(read_tools, "get_deployment_status")
-
-    async def inspect(state: AgentState) -> dict[str, object]:
-        """deployment 状態を根拠として読み、``app.war`` の再起動案を作る。"""
-        evidence = as_dict(await tool.ainvoke({"server_id": state["server_id"]}))
-        return {
-            "evidence": evidence,
-            "proposed_action": {
-                "tool": "restart_deployment",
-                "args": {"server_id": state["server_id"], "deployment_name": "app.war"},
-                "description": "app.war を再起動する",
-            },
-            "trace": [*state.get("trace", []), "inspect_deployment"],
-        }
-
-    return inspect
+def propose_deployment(state: AgentState) -> dict[str, object]:
+    """Deployment 障害の固定対処案を作る。"""
+    return {
+        "proposed_action": {
+            "tool": "restart_deployment",
+            "args": {"server_id": state["server_id"], "deployment_name": "app.war"},
+            "description": "app.war を再起動する",
+        },
+        "trace": [*state.get("trace", []), "propose_deployment"],
+    }
 
 
 def normal_activity(state: AgentState) -> dict[str, object]:
-    """正常ログなら MCP write や HITL に進まず、そのまま終了する。"""
+    """正常ログなら Teams / ToolNode / MCP write / HITL を呼ばず終了する。"""
     return {
         "proposed_action": None,
         "status": "NO_INCIDENT",
@@ -202,12 +296,7 @@ def normal_activity(state: AgentState) -> dict[str, object]:
 
 
 def approval(state: AgentState) -> dict[str, object]:
-    """write Tool の直前で Graph を停止し、人の approve/reject を待つ。
-
-    ``interrupt()`` には JSON 化できる対処案を渡す。再開時はこの Node の先頭から
-    再実行され、``Command(resume=True/False)`` の値が interrupt の戻り値になる。
-    interrupt より前には副作用を置かない。
-    """
+    """write Tool の直前で Graph を停止し、人の approve/reject を待つ。"""
     decision = interrupt(
         {
             "question": "この JBoss 変更を実行しますか？",
@@ -255,7 +344,7 @@ def make_execute_node(write_tools: Sequence[Any]):
 
 
 def make_verify_node(read_tools: Sequence[Any]):
-    """変更後の Fake JBoss を read Tool で確認し、復旧結果を判定する Node を返す。"""
+    """変更後の Fake JBoss を MCP read Tool で確認する Node を返す。"""
     thread_tool = by_name(read_tools, "get_thread_pool_status")
     datasource_tool = by_name(read_tools, "get_datasource_status")
     deployment_tool = by_name(read_tools, "get_deployment_status")
@@ -279,7 +368,7 @@ def make_verify_node(read_tools: Sequence[Any]):
             recovered = result.get("status") == "OK"
 
         return {
-            "evidence": result,
+            "evidence": {**state.get("evidence", {}), "recovery_verification": result},
             "recovered": recovered,
             "status": "RECOVERED" if recovered else "FAILED",
             "trace": [*state.get("trace", []), "verify_recovery"],
@@ -304,20 +393,29 @@ def build_graph(
     checkpointer: Any,
     settings: Settings,
     classifier: Any | None = None,
+    investigator: Any | None = None,
+    notifier: Callable[[str, str, str], dict[str, Any]] | None = None,
 ):
-    """学習用の 1 本の Graph を構築し、指定 Checkpointer 付きで compile する。
+    """JBoss 障害一次対応 Graph を構築し、指定 Checkpointer 付きで compile する。
 
-    本番では durable checkpointer が必要だが、このデモは 1 人・1 回だけを前提に
-    ``InMemorySaver`` を渡す。HITL の resume には同じ checkpointer と thread_id を使う。
+    Gemini に bind するのは diagnostic read Tool だけ。write Tool は ToolNode に渡さず、
+    Human approval 後の ``execute_fix`` Node からのみ実行する。
     """
+    diagnostic_tools = [tool for tool in read_tools if tool.name != "read_server_log"]
     resolved_classifier = classifier or build_classifier(settings)
+    resolved_investigator = investigator or build_investigator(settings, read_tools)
 
     graph = StateGraph(AgentState)
     graph.add_node("read_log", make_read_log_node(read_tools))
     graph.add_node("classify_log", make_classify_node(resolved_classifier))
-    graph.add_node("inspect_thread_pool", make_thread_pool_node(read_tools))
-    graph.add_node("inspect_datasource", make_datasource_node(read_tools))
-    graph.add_node("inspect_deployment", make_deployment_node(read_tools))
+    graph.add_node("notify_teams", make_notify_teams_node(settings, notifier))
+    graph.add_node("prepare_investigation", prepare_investigation)
+    graph.add_node("investigate", make_investigate_node(resolved_investigator))
+    graph.add_node("read_tools", ToolNode(diagnostic_tools))
+    graph.add_node("capture_tool_evidence", capture_tool_evidence)
+    graph.add_node("propose_thread_pool", propose_thread_pool)
+    graph.add_node("propose_datasource", propose_datasource)
+    graph.add_node("propose_deployment", propose_deployment)
     graph.add_node("normal_activity", normal_activity)
     graph.add_node("approval", approval)
     graph.add_node("execute_fix", make_execute_node(write_tools))
@@ -328,17 +426,25 @@ def build_graph(
     graph.add_edge("read_log", "classify_log")
     graph.add_conditional_edges(
         "classify_log",
+        route_after_classification,
+        {"incident": "notify_teams", "normal": "normal_activity"},
+    )
+    graph.add_edge("notify_teams", "prepare_investigation")
+    graph.add_edge("prepare_investigation", "investigate")
+    graph.add_edge("investigate", "read_tools")
+    graph.add_edge("read_tools", "capture_tool_evidence")
+    graph.add_conditional_edges(
+        "capture_tool_evidence",
         route_category,
         {
-            "THREAD_POOL_CONFIGURATION": "inspect_thread_pool",
-            "DATASOURCE_POOL_EXHAUSTION": "inspect_datasource",
-            "DEPLOYMENT_FAILURE": "inspect_deployment",
-            "NORMAL_ACTIVITY": "normal_activity",
+            "THREAD_POOL_CONFIGURATION": "propose_thread_pool",
+            "DATASOURCE_POOL_EXHAUSTION": "propose_datasource",
+            "DEPLOYMENT_FAILURE": "propose_deployment",
         },
     )
-    graph.add_edge("inspect_thread_pool", "approval")
-    graph.add_edge("inspect_datasource", "approval")
-    graph.add_edge("inspect_deployment", "approval")
+    graph.add_edge("propose_thread_pool", "approval")
+    graph.add_edge("propose_datasource", "approval")
+    graph.add_edge("propose_deployment", "approval")
     graph.add_edge("normal_activity", END)
     graph.add_conditional_edges(
         "approval",

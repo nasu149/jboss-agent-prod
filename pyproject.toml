@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jboss-incident-agent"
-version = "2.0.0"
-description = "Minimal LangGraph + Gemini + MCP + Human-in-the-loop learning demo"
+version = "2.1.0"
+description = "JBoss incident response demo using LangGraph, Gemini, MCP, ToolNode and Human-in-the-loop"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "langgraph>=1.1.5,<2",
@@ -15,6 +15,7 @@ dependencies = [
   "streamlit>=1.45,<2",
   "pydantic>=2.10,<3",
   "python-dotenv>=1,<2",
+  "httpx>=0.28,<1",
 ]
 
 [project.optional-dependencies]

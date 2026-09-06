@@ -1,7 +1,7 @@
-"""Streamlit で LangGraph / MCP / Human-in-the-loop を 1 回だけ試す学習画面。
+"""JBoss 障害一次対応 Agent を操作する Streamlit 画面。
 
-画面を業務アプリとして作り込むことは目的にしない。シナリオ投入、Graph 実行、
-interrupt の承認・拒否、State/Node trace の確認だけに絞っている。
+疑似障害の投入、LangGraph 実行、Human-in-the-loop の承認/拒否、および
+State / Tool 選択 / Teams 通知結果 / Node trace の確認に絞ったデモ UI。
 """
 
 from __future__ import annotations
@@ -79,24 +79,30 @@ def execute(resume: bool | None = None) -> None:
 
 ensure_learning_run()
 
-st.title("JBoss Incident Agent - Learning Minimum")
-st.caption("目的: LangGraph の State/Node/Conditional Edge、MCP、Human-in-the-loop を最小コードで追う")
+st.title("JBoss Incident Response Agent")
+st.caption("Gemini / LangGraph / MCP / ToolNode / Human-in-the-loop を使った JBoss 障害一次対応デモ")
 
 st.code(
     """START → read_log(MCP) → classify_log(Gemini)
-                         ↓ category
-      ┌──────────────────┼────────────────────┐
-      ↓                  ↓                    ↓
- thread pool         datasource          deployment        normal
-      └──────────────────┴────────────────────┘             ↓
-                         ↓                                  END
-                   approval(interrupt)
-                    ↓ approve/reject
-                execute_fix(MCP)
                          ↓
-                verify_recovery(MCP)
-                         ↓
-                        END""",
+                    normal / incident
+                      ↙       ↘
+                    END   notify_teams
+                               ↓
+                     investigate(Gemini)
+                     read Tool を選択
+                               ↓
+                       read_tools(ToolNode)
+                               ↓
+                     category 別の対処案
+                               ↓
+                    approval(interrupt)
+                      ↓ approve/reject
+                  execute_fix(MCP)
+                               ↓
+                  verify_recovery(MCP)
+                               ↓
+                              END""",
     language="text",
 )
 
@@ -128,15 +134,27 @@ if result:
     st.write(f"**category:** `{result.get('category', '—')}`")
     st.write(f"**summary:** {result.get('summary', '—')}")
     st.write(f"**status:** `{result.get('status', 'RUNNING / INTERRUPTED')}`")
+
+    if result.get("teams_result"):
+        st.write("**Teams notification**")
+        st.json(result["teams_result"])
+
+    if result.get("selected_read_tools"):
+        st.write("**Gemini selected read Tool**")
+        st.code(", ".join(result["selected_read_tools"]), language="text")
+
     if result.get("evidence"):
         st.write("**MCP evidence**")
         st.json(result["evidence"])
+
     if result.get("proposed_action"):
         st.write("**proposed action**")
         st.json(result["proposed_action"])
+
     if result.get("execution_result"):
         st.write("**write result**")
         st.json(result["execution_result"])
+
     st.write("**Node trace**")
     st.code(" → ".join(result.get("trace", [])), language="text")
 
