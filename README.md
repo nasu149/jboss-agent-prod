@@ -1,752 +1,449 @@
-# JBoss Incident Response Agent
+# JBoss Incident Agent - Learning Minimum
 
-LangGraph / Gemini / MCP / Human-in-the-loop を使った、**JBoss障害一次対応Agentの完成版デモ**です。
+**LangGraph / Gemini / MCP / Human-in-the-loop を、コードを追いながら学ぶための最小デモ**です。
 
-学習途中のサンプルや個別CLIは削除し、**Streamlitアプリを動かすために必要なものだけ**を残しています。
-起動は基本的にこれだけです。
+このリポジトリは「実運用に耐える障害対応基盤」を目指しません。
+1 人が 1 回、Fake JBoss の疑似障害を解析して、必要なら人の承認後に復旧操作を行えれば十分、という前提で意図的に単純化しています。
+
+## まず何を学ぶサンプルなのか
+
+このデモで確認するポイントは 4 つだけです。
+
+1. **State**: Node 間で値がどう受け渡されるか
+2. **Conditional Edge**: Gemini の分類結果によって次の Node がどう変わるか
+3. **MCP**: LangGraph プロセスから別プロセスの Fake JBoss Tool をどう呼ぶか
+4. **Human-in-the-loop**: `interrupt()` で止まり、同じ `thread_id` を `Command(resume=...)` で再開するとはどういうことか
+
+本番運用向けの機能は、学習の邪魔になるため削除しています。
+
+---
+
+## 1. 最短で動かす
+
+前提:
+
+- Docker Desktop
+- VS Code
+- Dev Containers 拡張
+- Gemini API Key
+
+`.env` を作ります。
+
+```bash
+cp .env.example .env
+```
+
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+API Key を設定します。
+
+```env
+GOOGLE_API_KEY=あなたのGemini API Key
+```
+
+VS Code で:
+
+```text
+Dev Containers: Reopen in Container
+```
+
+テスト:
+
+```bash
+make test
+```
+
+アプリ起動:
 
 ```bash
 make app
 ```
 
-このREADMEだけ読めば、セットアップ・操作方法・アーキテクチャ・各技術の役割・コードの読み方が分かるようにしています。
+ブラウザ:
+
+```text
+http://localhost:8501
+```
 
 ---
 
-## 1. このアプリでできること
+## 2. 画面でやること
 
-画面からFake JBossへ障害を注入し、Agentに障害対応をさせられます。
+操作はほぼ 3 ステップです。
 
-- Fake JBossの `server.log` を**前回cursor以降だけ**取得
-- 新しいログがなければGeminiを呼ばず終了
-- 新しいログがあればGeminiがIncidentか判定
-- IncidentならTeamsへ通知（デフォルトはDry Run）
-- Geminiが**read-only MCP Tool**を自分で選んで追加調査
-- Geminiが原因と対処案をStructured Outputで返す
-- PythonのRisk Policyが対処案を検証
-- write操作の直前でLangGraph `interrupt()`
-- Streamlit上で人間が **Approve / Reject / Edit & Approve**
-- Approveされた場合だけMCP write Toolを実行
-- Pythonで復旧状態を確認
-- 復旧しなければ有限回だけ再調査
-- SQLite Checkpointerにcursorと承認待ちStateを永続化
-- UIでIncident、Tool利用、診断、復旧結果を確認
+1. シナリオを選んで **「このシナリオを投入」**
+2. **「Agent を実行」**
+3. 変更が必要なら **Approve / Reject**
 
-デモ用に以下のイベントを注入できます。
+シナリオは従来と同じ 4 種類です。
 
 - `THREAD_POOL_CONFIGURATION`
 - `DATASOURCE_POOL_EXHAUSTION`
 - `DEPLOYMENT_FAILURE`
 - `NORMAL_ACTIVITY`
 
-Ground Truth（正解ラベル）はAgentから分離されたSQLiteに保存されるため、Agentは正解をカンニングできません。
+Fake JBoss にはシナリオ名そのものを保存しません。
+Agent は `server.log` と MCP の read Tool の結果だけを見ます。
 
 ---
 
-## 2. 最短で動かす
+## 3. Graph 全体
 
-### 前提
-
-- Docker Desktop
-- VS Code
-- VS Code Dev Containers拡張
-- Gemini API Key
-
-### ① ZIPを展開してVS Codeで開く
-
-展開したディレクトリそのものをVS Codeで開いてください。
-
-### ② `.env` を作る
-
-PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-bash:
-
-```bash
-cp .env.example .env
-```
-
-最低限これだけ設定します。
-
-```env
-GOOGLE_API_KEY=あなたのGemini API Key
-```
-
-Teamsを実際に送信しない場合は、そのまま以下でOKです。
-
-```env
-TEAMS_DRY_RUN=true
-```
-
-### ③ Dev Containerを開く
-
-VS Codeで:
-
-```text
-Ctrl+Shift+P
-→ Dev Containers: Reopen in Container
-```
-
-初回はDocker imageのbuildとPython packageのinstallが実行されます。
-
-### ④ テスト
-
-```bash
-make test
-```
-
-### ⑤ アプリ起動
-
-```bash
-make app
-```
-
-ブラウザで:
-
-```text
-http://localhost:8501
-```
-
-`.streamlit/config.toml` にportとaddressを設定しているため、`make app` に長い引数は不要です。
-
----
-
-## 3. 画面でのおすすめ操作
-
-最初はこの順番で触るのが一番分かりやすいです。
-
-### 1. `Inject Random Event`
-
-Fake JBossにランダムな障害または正常イベントを発生させます。
-
-### 2. `Run scan now`
-
-Monitoring Graphが動きます。
-
-```text
-server.log
-   ↓ cursor差分取得
-新規ログあり？
-   ├─ No  → 終了（Geminiを呼ばない）
-   └─ Yes → Geminiで分類
-                ↓
-             Incident?
-             ├─ No  → 終了
-             └─ Yes → Teams通知
-                         ↓
-                    Incident Graph
-```
-
-### 3. Agentが自律調査
-
-Incident GraphではGeminiにread-only MCP Toolだけを渡しています。
-
-例:
-
-```text
-Gemini
-  ↓
-get_thread_pool_status を呼びたい
-  ↓
-MCP Tool
-  ↓
-ToolMessage
-  ↓
-Gemini
-  ↓
-追加調査 or 診断へ
-```
-
-### 4. Human approval
-
-変更が必要な場合、Graphはwrite操作の直前で停止します。
-
-```text
-Risk Policy
-   ↓
-interrupt()
-   ↓
-PENDING_APPROVAL
-```
-
-Streamlitに承認UIが表示されます。
-
-- Approve
-- Reject
-- Edit & Approve
-
-### 5. Approveすると復旧処理
-
-```text
-Human Approve
-   ↓
-Command(resume=...)
-   ↓
-同じ thread_id のGraphを再開
-   ↓
-Pythonがwrite Toolを決定
-   ↓
-MCP write Tool
-   ↓
-Fake JBoss
-   ↓
-Recovery Verification
-```
-
----
-
-## 4. 全体アーキテクチャ
-
-```text
-┌──────────────────────────────────────────────────────────┐
-│                    Streamlit app.py                      │
-│  Inject / Scan / Approve / Incident / Activity          │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           ▼
-                 ┌──────────────────┐
-                 │   AgentService   │
-                 └───────┬──────────┘
-                         │
-          ┌──────────────┴───────────────┐
-          ▼                              ▼
-┌───────────────────┐          ┌────────────────────┐
-│ Monitoring Graph  │          │   Incident Graph   │
-│                   │          │                    │
-│ log delta         │          │ Gemini             │
-│ Gemini classify   │          │   ↓                │
-│ Teams notify      │          │ read MCP Tool loop │
-└─────────┬─────────┘          │   ↓                │
-          │                    │ diagnosis          │
-          │                    │   ↓                │
-          │                    │ Python Risk Policy │
-          │                    │   ↓                │
-          │                    │ interrupt()        │
-          │                    │   ↓                │
-          │                    │ Human approval     │
-          │                    │   ↓                │
-          │                    │ write MCP Tool     │
-          │                    │   ↓                │
-          │                    │ recovery verify    │
-          │                    └─────────┬──────────┘
-          │                              │
-          └──────────────┬───────────────┘
-                         ▼
-              ┌─────────────────────┐
-              │ LangChain MCP Tool  │
-              └──────────┬──────────┘
-                         │ stdio
-                         ▼
-              ┌─────────────────────┐
-              │ Fake JBoss MCP      │
-              │ Server              │
-              └──────────┬──────────┘
-                         ▼
-              ┌─────────────────────┐
-              │ File-backed         │
-              │ Fake JBoss          │
-              └─────────────────────┘
-```
-
----
-
-## 5. 誰が何を決めているのか
-
-このプロジェクトで一番重要な設計ポイントです。
-
-| 担当 | 任せていること |
-|---|---|
-| **Gemini** | ログの意味判断、次に調べるread Toolの選択、原因診断、対処案の提案 |
-| **LangGraph** | State、Node/Edge、Tool loop、Conditional Edge、interrupt、再開、復旧loop |
-| **Python** | Risk Policy、値の範囲チェック、write Toolの決定、復旧条件、ループ上限 |
-| **MCP** | JBoss能力を明示的なToolとして別プロセスから公開 |
-| **Human** | write操作の最終承認・拒否・値編集 |
-| **SQLite Checkpointer** | LangGraph State、cursor、pending interrupt、thread_idの継続 |
-| **Runtime SQLite** | Streamlit表示用のIncident概要・Activity |
-| **Simulator SQLite** | Agentから見えないGround Truth |
-
-### 特に重要な安全境界
-
-Geminiには次のread Toolだけを渡します。
-
-```text
-read_server_log
-get_server_health
-get_thread_pool_status
-get_datasource_status
-get_deployment_status
-get_recent_config_changes
-```
-
-Geminiにはwrite Toolをbindしません。
-
-write Toolは:
-
-```text
-set_thread_pool_max_threads
-set_datasource_max_pool_size
-restart_deployment
-reload_server
-```
-
-ですが、実行経路は必ず:
-
-```text
-Geminiの対処案
-   ↓
-Python Risk Policy
-   ↓
-Human Approval
-   ↓
-PythonがTool名を決定
-   ↓
-MCP write Tool
-```
-
-です。
-
-`execute_shell` や `execute_jboss_cli` のような「何でもできるTool」は公開していません。
-
----
-
-## 6. LangGraphは2つだけ
-
-完成版ではGraphを2本に絞っています。
-
-### Monitoring Graph
-
-ファイル:
-
-```text
-src/jboss_agent/graphs/monitoring.py
-```
-
-役割:
+Graph は **1 本だけ**です。
 
 ```text
 START
   ↓
-start_cycle
+read_log                         ← MCP
   ↓
-collect_logs
+classify_log                     ← Gemini
   ↓
-新規ログあり？
- ├─ No → commit_cursor → END
- └─ Yes
-      ↓
-   analyze_logs (Gemini Structured Output)
-      ↓
-   Incident?
-   ├─ No → commit_cursor → END
-   └─ Yes
+Conditional Edge(category)
+  ├─ THREAD_POOL_CONFIGURATION
+  │      ↓
+  │  inspect_thread_pool         ← MCP read
+  │
+  ├─ DATASOURCE_POOL_EXHAUSTION
+  │      ↓
+  │  inspect_datasource          ← MCP read
+  │
+  ├─ DEPLOYMENT_FAILURE
+  │      ↓
+  │  inspect_deployment          ← MCP read
+  │
+  └─ NORMAL_ACTIVITY
+         ↓
+     normal_activity
+         ↓
+        END
+
+障害3系統はここで合流
+  ↓
+approval                         ← interrupt()
+  ↓
+Approve / Reject                 ← Human
+  ├─ Reject → rejected → END
+  └─ Approve
         ↓
-     create_incident
+    execute_fix                  ← MCP write
         ↓
-     notify_teams
-        ↓
-     commit_cursor
+    verify_recovery              ← MCP read
         ↓
        END
 ```
 
-### Incident Graph
+### 一番見てほしい箇所
 
-ファイル:
-
-```text
-src/jboss_agent/graphs/incident.py
-```
-
-役割:
-
-```text
-START
- ↓
-prepare_investigation
- ↓
-investigate (Gemini)
- ↓
-read MCP Tool が必要？
- ├─ Yes → ToolNode → evidence → investigateへ
- └─ No  → diagnose
-                 ↓
-            validate_action
-                 ↓
-             Risk Policy
-          ┌──────┼─────────┐
-          │      │         │
-       BLOCK   NONE    write候補
-          │      │         ↓
-         END    END    interrupt()
-                            ↓
-                          Human
-                            ↓
-                    prepare_write
-                            ↓
-                       ToolNode
-                            ↓
-                    verify_recovery
-                     ├─ OK → END
-                     └─ NG → 再調査
-```
-
----
-
-## 7. State / thread_id / Checkpointer
-
-### Monitoring
-
-固定thread_idを使います。
-
-```text
-monitor:jboss-01
-```
-
-そのため前回の:
-
-```text
-previous_log_cursor = 1234
-```
-
-をSQLite Checkpointerから引き継げます。
-
-### Incident
-
-Incidentごとに別threadです。
-
-```text
-incident:inc-xxxxxxxxxx
-```
-
-`interrupt()` が発生するとStateがSQLiteに保存されます。
-
-Approve時には:
+`src/jboss_agent/graph.py` のこの組み合わせです。
 
 ```python
-Command(resume={"decision": "approve"})
+graph.add_conditional_edges(
+    "classify_log",
+    route_category,
+    {
+        "THREAD_POOL_CONFIGURATION": "inspect_thread_pool",
+        "DATASOURCE_POOL_EXHAUSTION": "inspect_datasource",
+        "DEPLOYMENT_FAILURE": "inspect_deployment",
+        "NORMAL_ACTIVITY": "normal_activity",
+    },
+)
 ```
 
-を**同じthread_id**へ渡して再開します。
-
-重要なのは、Python threadを起動しっぱなしにしているわけではないことです。
-StateをSQLiteから復元して処理を再開しています。
+Gemini が `category` を返す → State に入る → `route_category()` が読む → 次の Node が決まる、という流れです。
 
 ---
 
-## 8. MCPを使っている理由
+## 4. State は何を持つか
 
-Fake JBossはLangGraphプロセスの中のPython関数として直接呼ぶのではなく、別プロセスのMCP Serverとして公開します。
+`AgentState` は必要最小限です。
+
+| Key | 意味 |
+|---|---|
+| `server_id` | 対象 Fake JBoss |
+| `log_lines` | MCP で取得した `server.log` |
+| `category` | Gemini の分類結果 |
+| `summary` | Gemini の分類理由 |
+| `evidence` | 分岐先 MCP read Tool の結果 |
+| `proposed_action` | Python が作った固定対処案 |
+| `approved` | Human の判断 |
+| `execution_result` | MCP write Tool の結果 |
+| `recovered` | 復旧確認結果 |
+| `status` | 画面表示用の最終状態 |
+| `trace` | 通過した Node の順番 |
+
+画面の `Node trace` を見ると例えば:
 
 ```text
-LangGraph process
-     │
-     │ MCP / stdio
-     ▼
-Fake JBoss MCP Server process
+read_log → classify_log → inspect_thread_pool → approval → execute_fix → verify_recovery
 ```
 
-これによりAgent側から見ると、JBossの実装詳細ではなく「利用可能なCapability」だけが見えます。
-
-`src/jboss_agent/mcp/server.py` がMCP Server、`src/jboss_agent/mcp/client.py` がLangGraph側のadapterです。
-
-Fake JBoss本体の状態はファイルに保存されるため、LangGraph側プロセスとMCP Server側プロセスの両方から同じ状態を参照できます。
+と表示されます。
 
 ---
 
-## 9. TeamsはなぜMCPではないのか
+## 5. LLM に何を任せているか
 
-Teams通知はアプリケーション自身が持つintegrationとして、ローカルのLangChain `@tool` にしています。
-
-```text
-src/jboss_agent/teams.py
-```
-
-つまりこのサンプルでは:
+Gemini に任せているのは **ログ分類だけ**です。
 
 ```text
-JBossのCapability → MCP
-Teams通知         → Local Tool
+server.log
+   ↓
+Gemini
+   ↓
+THREAD_POOL_CONFIGURATION
+or DATASOURCE_POOL_EXHAUSTION
+or DEPLOYMENT_FAILURE
+or NORMAL_ACTIVITY
 ```
 
-という違いを残しています。
+対処 Tool 名や write 引数は Gemini に自由生成させません。
 
-デフォルト:
+たとえば thread pool なら、分岐先 Node が固定で:
 
-```env
-TEAMS_DRY_RUN=true
+```text
+set_thread_pool_max_threads(value=80)
 ```
 
-なので実際にはTeamsへ送信せず、payloadだけ生成します。
+を対処候補として作ります。
 
-実送信する場合:
-
-```env
-TEAMS_DRY_RUN=false
-TEAMS_WEBHOOK_URL=https://...
-```
+これは「LLM に任せる判断」と「Python で固定する制御」を分けて見やすくするためです。
 
 ---
 
-## 10. データはどこに保存されるか
+## 6. MCP はどこで使うか
 
-すべて `.data/` 配下です。
+MCP Server は別 Python プロセスです。
 
 ```text
-.data/
-├── checkpoints.sqlite   # LangGraph State / interrupt / cursor
-├── runtime.sqlite       # UI表示用Incident / Activity
-├── simulator.sqlite     # Ground Truth（Agentから分離）
-└── fake_jboss/
-    ├── state.json       # Fake JBossの状態
-    └── server.log       # Fake server.log
+Streamlit / LangGraph process
+         │
+         │ stdio MCP
+         ▼
+jboss_agent.mcp.server
+         │
+         ▼
+FakeJBoss
+         │
+         ├─ state.json
+         └─ server.log
 ```
 
-`.data/` はGitにもZIPにも含めません。
+### read Tool
 
-デモを完全に初期化したい場合は、アプリを停止して:
+- `read_server_log`
+- `get_thread_pool_status`
+- `get_datasource_status`
+- `get_deployment_status`
 
-```bash
-make reset
-```
+### write Tool
 
-その後もう一度:
+- `set_thread_pool_max_threads`
+- `set_datasource_max_pool_size`
+- `restart_deployment`
 
-```bash
-make app
-```
-
-を実行してください。
+read/write を分けていますが、複雑な RBAC や Risk Policy はありません。
+このデモでは **Human approval の後にしか write Node へ進まない**ことで境界を見せます。
 
 ---
 
-## 11. ディレクトリ構成
+## 7. Human-in-the-loop と Checkpoint
 
-意図的にかなり小さくしています。
+`approval` Node では:
+
+```python
+decision = interrupt({...})
+```
+
+を呼びます。
+
+この瞬間に Graph は停止します。
+
+今回は 1 人・1 回だけなので、SQLite や PostgreSQL は使わず:
+
+```python
+InMemorySaver()
+```
+
+を Checkpointer にしています。
+
+ただし HITL の基本原理は同じです。
+
+```text
+初回 invoke
+  ↓
+interrupt()
+  ↓
+State を Checkpointer に保存
+  ↓
+画面で Approve
+  ↓
+Command(resume=True)
+  ↓
+同じ thread_id
+  ↓
+approval Node から再開
+```
+
+重要なのは、**Python thread をずっと待機させているわけではない**ことです。
+
+このサンプルでは Streamlit の `session_state` に `InMemorySaver` を置くため、アプリプロセスを再起動すると Checkpoint は消えます。それで問題ない、という学習用の割り切りです。
+
+---
+
+## 8. Fake JBoss
+
+実 JBoss を立てると学習対象が増えすぎるため、次だけを JSON / log で模擬します。
+
+```text
+.data/fake_jboss/
+├── state.json
+└── server.log
+```
+
+3 障害は非常に単純です。
+
+### Thread Pool
+
+```text
+max_threads=20
+active_threads=20
+queue_size=37
+```
+
+承認後:
+
+```text
+max_threads=80
+queue_size=0
+```
+
+### Datasource
+
+```text
+max_pool_size=5
+timed_out_requests=14
+```
+
+承認後:
+
+```text
+max_pool_size=30
+timed_out_requests=0
+```
+
+### Deployment
+
+```text
+app.war status=FAILED
+```
+
+承認後:
+
+```text
+app.war status=OK
+```
+
+現実の JBoss の挙動として正確であることより、LangGraph の処理を追いやすいことを優先しています。
+
+---
+
+## 9. ディレクトリ構成
 
 ```text
 .
-├── app.py                         # Streamlit UI / entry point
+├── app.py
 ├── README.md
-├── Makefile
 ├── Dockerfile
+├── Makefile
 ├── pyproject.toml
 ├── .env.example
 ├── .devcontainer/
-│   └── devcontainer.json
 ├── .streamlit/
-│   └── config.toml
+├── docs/
+│   └── LEARNING_GUIDE.md
 ├── src/jboss_agent/
-│   ├── config.py                  # .env
-│   ├── models.py                  # Structured Output schemas
-│   ├── llm.py                     # Gemini client
-│   ├── policy.py                  # deterministic Risk Policy
-│   ├── service.py                 # UIとGraphを接続
-│   ├── persistence.py             # SQLite Checkpointer
-│   ├── runtime_store.py           # UI metadata SQLite
-│   ├── simulator.py               # Fault injection + Ground Truth
-│   ├── fake_jboss.py              # Fake JBoss本体
-│   ├── teams.py                   # Local Teams Tool
-│   ├── graphs/
-│   │   ├── state.py
-│   │   ├── prompts.py
-│   │   ├── monitoring.py
-│   │   └── incident.py
+│   ├── config.py
+│   ├── fake_jboss.py
+│   ├── graph.py
 │   └── mcp/
 │       ├── client.py
 │       └── server.py
 └── tests/
+    ├── test_fake_jboss.py
+    ├── test_graph.py
+    └── test_mcp.py
 ```
 
-学習途中のサンプル、個別CLI、Scheduler、Evaluation Runner、重複Graphはありません。
+コードを読む順番は:
+
+1. `graph.py`
+2. `app.py`
+3. `mcp/client.py`
+4. `mcp/server.py`
+5. `fake_jboss.py`
+
+がおすすめです。
 
 ---
 
-## 12. コードを読むおすすめ順
+## 10. 今回あえて削ったもの
 
-### ① `app.py`
+以前の構成には以下がありましたが、今回の学習目的には過剰なので削除しました。
 
-ユーザー操作が何を呼んでいるかを見る。
+- Monitoring Graph と Incident Graph の 2 Graph 構成
+- ログ byte cursor と定期監視の状態管理
+- Incident ID 管理
+- Runtime SQLite
+- Ground Truth SQLite
+- SQLite Checkpointer
+- Service 層
+- Teams 通知
+- Agentic read Tool loop
+- LLM 診断用の別モデル呼び出し
+- Risk Policy
+- 値編集付き承認
+- 復旧失敗時の再調査 loop
+- 複数 Incident / 複数 user を想定した永続化
 
-### ② `service.py`
-
-Monitoring GraphとIncident Graphがどう繋がるかを見る。
-
-### ③ `graphs/monitoring.py`
-
-State / Node / Edge / Conditional Edge / cursorを見る。
-
-### ④ `graphs/incident.py`
-
-ToolNode / Agentic Tool loop / interrupt / Command(resume) / recovery loopを見る。
-
-### ⑤ `mcp/client.py` と `mcp/server.py`
-
-LangGraphと別プロセスのCapability境界を見る。
-
-### ⑥ `policy.py`
-
-LLMではなく普通のPythonに任せるべき制御を見る。
-
-この順番だと全体像から詳細へ降りていけます。
+これらは「必要になった段階で 1 個ずつ追加する」方が LangGraph を理解しやすいです。
 
 ---
 
-## 13. Makefile
-
-コマンドは必要最低限です。
+## 11. テスト
 
 ```bash
-make app      # Streamlit起動
-make test     # pytest
-make lint     # ruff
-make check    # lint + test
-make install  # Python依存を再install
-make reset    # .dataを削除してデモ初期化
+make check
 ```
 
-普段使うのはほぼ:
+確認内容:
 
-```bash
-make app
-```
+- 3 障害が Fake JBoss 上で復旧できる
+- LLM category ごとに期待した Node へ分岐する
+- `interrupt()` 前には write が走らない
+- `Command(resume=True)` で同じ Checkpoint を再開して write が走る
+- Reject なら write が走らない
+- `NORMAL_ACTIVITY` は HITL なしで終了する
+- 実際に stdio MCP Server を起動し Tool を取得・実行できる
 
-だけです。
+PR では GitHub Actions でも `ruff` と `pytest` を実行します。
 
 ---
 
-## 14. `.env` 一覧
+## 12. 次に機能を足すなら
 
-| 変数 | 必須 | 用途 |
-|---|---:|---|
-| `GOOGLE_API_KEY` | Yes | Gemini API |
-| `GEMINI_MODEL` | No | Gemini model名 |
-| `GEMINI_TEMPERATURE` | No | temperature |
-| `TEAMS_DRY_RUN` | No | Teams実送信を止める |
-| `TEAMS_WEBHOOK_URL` | Teams実送信時 | Teams webhook |
-| `SERVER_ID` | No | Fake JBoss ID |
-| `FAKE_JBOSS_DATA_DIR` | No | Fake JBoss保存先 |
-| `CHECKPOINT_DB_PATH` | No | LangGraph SQLite |
-| `RUNTIME_DB_PATH` | No | UI metadata SQLite |
-| `SIMULATOR_DB_PATH` | No | Ground Truth SQLite |
-| `MAX_INVESTIGATION_ROUNDS` | No | read Tool調査の上限 |
-| `MAX_RECOVERY_ATTEMPTS` | No | 復旧再試行の上限 |
-
----
-
-## 15. テストで確認していること
-
-`make test` では、少なくとも以下を確認します。
-
-- `.env` 設定読込
-- Risk Policyの許可 / BLOCK
-- Fake JBoss writeのvalidationとidempotency
-- Ground TruthがAgent-visible stateに混ざらないこと
-- Runtime SQLiteのcursor / pending approval
-- `langgraph-checkpoint-sqlite` が実際にinstallされていること
-- Monitoring Graphが同一thread_idでcursorを引き継ぐこと
-- 新規ログがない場合Geminiを呼ばないこと
-- Incident Graphがinterruptで停止すること
-- 同じthread_idに `Command(resume=...)` して再開できること
-- Approve後だけwrite Toolが実行され、復旧判定まで進むこと
-
----
-
-## 16. よくあるエラー
-
-### `No module named 'langgraph.checkpoint.sqlite'`
-
-SQLite CheckpointerはLangGraph本体とは別packageです。
-この完成版では通常依存に明示的に入れています。
-
-```toml
-langgraph-checkpoint-sqlite>=3.1,<4
-```
-
-古いDev Containerを使い回している場合:
-
-```bash
-make install
-```
-
-またはVS Codeで:
+この最小版を理解したあとに、学習目的ごとに 1 個ずつ足すのがおすすめです。
 
 ```text
-Dev Containers: Rebuild Container
+Step 1  ← 今ここ: 1 Graph / 1 run / InMemorySaver
+Step 2  ToolNode を使って LLM 自身に read Tool を選ばせる
+Step 3  SQLite Checkpointer に変える
+Step 4  監視 cursor を追加する
+Step 5  復旧失敗時の retry loop を追加する
+Step 6  Teams の Local Tool を追加する
 ```
 
-を実行してください。
-
-確認:
-
-```bash
-python -c "from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver; print('OK')"
-```
-
-### `GOOGLE_API_KEY is not configured`
-
-`.env` を確認してください。
-
-```env
-GOOGLE_API_KEY=...
-```
-
-### Port 8501が開かない
-
-Dev Containerのport forwardingを確認してください。
-
-```text
-Ports → 8501
-```
-
-### Reject後もFake JBossが障害状態
-
-Rejectは「変更しない」が正しい挙動なので、その時点では障害は残ります。
-次のFault Injection時にはサーバー状態だけ正常なbaselineへ戻してから新しいシナリオを入れるため、前の障害状態は混ざりません。
-完全に履歴も含めて初期化したい場合はアプリを停止して:
-
-```bash
-make reset
-```
-
----
-
-## 17. このサンプルを本物のJBossへ発展させるなら
-
-現在のFake JBossを置き換える境界はMCP Serverです。
-
-つまりLangGraph側を大きく変えずに:
-
-```text
-Fake JBoss MCP Server
-        ↓
-Real JBoss Management API / JBoss CLI wrapper
-```
-
-へ変更できます。
-
-ただし本番化では追加で以下が必要です。
-
-- 認証・認可
-- Secret管理
-- TLS / network security
-- Tool単位のRBAC
-- write操作の監査ログ
-- 冪等性key
-- timeout / retry / circuit breaker
-- 複数server対応
-- PostgreSQL等の本番向けCheckpointer
-- Teams以外の通知経路
-- observability / tracing
-
-このプロジェクトは、それらを載せる前の**Agent設計の最小骨格**として使う想定です。
-
-
-## Troubleshooting
-
-### `Gemini skipped` が続く場合
-
-**Inject Random Event** のあとに **Run scan now** を押してください。v1.0.1 では MCP content block の正規化を共通化し、注入後の新規ログを正しく検出できるよう修正しています。
+最初から全部入りに戻さないことが、このリポジトリを学習教材として使う上でのポイントです。
