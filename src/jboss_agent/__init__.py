@@ -1,1 +1,1 @@
-"""JBoss 障害一次対応デモのパッケージ。"""
+"""JBoss incident-response learning demo."""
