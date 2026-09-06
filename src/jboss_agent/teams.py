@@ -1,81 +1,50 @@
-"""ローカルの Teams 通知ツール。MCP とは別の連携として実装する。"""
+"""JBoss 障害検知結果を Microsoft Teams へ通知する小さな連携モジュール。"""
 
 from __future__ import annotations
 
-import json
-import logging
-from threading import Lock
-from typing import Literal
+from typing import Any
 
 import httpx
-from langchain_core.tools import tool
-from pydantic import BaseModel, Field
 
-from jboss_agent.config import get_settings
-
-logger = logging.getLogger(__name__)
-Severity = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-_delivery_lock = Lock()
-_delivered_incidents: set[str] = set()
+from jboss_agent.config import Settings
 
 
-class TeamsAlert(BaseModel):
-    server_id: str = Field(min_length=1)
-    incident_id: str = Field(min_length=1)
-    severity: Severity
-    category: str = Field(min_length=1)
-    confidence: float = Field(ge=0.0, le=1.0)
-    summary: str = Field(min_length=1)
-
-
-def _message(alert: TeamsAlert) -> str:
-    return (
+def _payload(server_id: str, category: str, summary: str) -> dict[str, str]:
+    """Teams Webhook に送る最小の text payload を作る。"""
+    text = (
         "[JBoss Incident Detected]\n"
-        f"Server: {alert.server_id}\n"
-        f"Severity: {alert.severity}\n"
-        f"Category: {alert.category}\n"
-        f"Confidence: {alert.confidence:.0%}\n"
-        f"Summary: {alert.summary}\n"
-        f"Incident ID: {alert.incident_id}"
+        f"Server: {server_id}\n"
+        f"Category: {category}\n"
+        f"Summary: {summary}"
     )
+    return {"text": text}
 
 
-@tool(args_schema=TeamsAlert)
 def send_teams_alert(
+    settings: Settings,
+    *,
     server_id: str,
-    incident_id: str,
-    severity: Severity,
     category: str,
-    confidence: float,
     summary: str,
-) -> str:
-    """同一障害の重複送信を抑止して Teams に通知する。"""
-    alert = TeamsAlert(
-        server_id=server_id,
-        incident_id=incident_id,
-        severity=severity,
-        category=category,
-        confidence=confidence,
-        summary=summary,
-    )
-    settings = get_settings()
+) -> dict[str, Any]:
+    """障害分類結果を Teams Webhook へ送る。
 
-    with _delivery_lock:
-        if incident_id in _delivered_incidents:
-            return json.dumps({"success": True, "status": "duplicate_skipped"})
+    ``TEAMS_DRY_RUN=true`` の場合はネットワーク送信せず、送る予定の payload を返す。
+    dry-run を無効にした状態で URL が未設定なら失敗結果を返す。
+    """
+    payload = _payload(server_id, category, summary)
 
-    payload = {"text": _message(alert)}
     if settings.teams_dry_run:
-        logger.info("TEAMS_DRY_RUN payload=%s", json.dumps(payload, ensure_ascii=False))
-        status = "dry_run"
-    else:
-        if not settings.teams_webhook_url:
-            return json.dumps({"success": False, "status": "missing_webhook_url"})
-        with httpx.Client(timeout=10.0) as client:
-            response = client.post(settings.teams_webhook_url, json=payload)
-            response.raise_for_status()
-        status = "sent"
+        return {"success": True, "status": "dry_run", "payload": payload}
 
-    with _delivery_lock:
-        _delivered_incidents.add(incident_id)
-    return json.dumps({"success": True, "status": status, "payload": payload}, ensure_ascii=False)
+    if not settings.teams_webhook_url.strip():
+        return {"success": False, "status": "missing_webhook_url", "payload": payload}
+
+    response = httpx.post(settings.teams_webhook_url, json=payload, timeout=10.0)
+    response.raise_for_status()
+    return {
+        "success": True,
+        "status": "sent",
+        "status_code": response.status_code,
+        "payload": payload,
+    }

@@ -1,77 +1,113 @@
-"""別プロセスの Fake JBoss MCP サーバーを LangChain から利用するアダプター。"""
+"""Fake JBoss MCP サーバーを起動し、LangGraph から使う Tool を取得する。"""
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Iterable
-from typing import Any, Protocol
+from typing import Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-READ_TOOL_NAMES = frozenset(
-    {
-        "read_server_log",
-        "get_server_health",
-        "get_thread_pool_status",
-        "get_datasource_status",
-        "get_deployment_status",
-        "get_recent_config_changes",
-    }
+from jboss_agent.config import get_settings
+
+READ_TOOLS = frozenset(
+    {"read_server_log", "get_thread_pool_status", "get_datasource_status", "get_deployment_status"}
 )
-WRITE_TOOL_NAMES = frozenset(
-    {
-        "set_thread_pool_max_threads",
-        "set_datasource_max_pool_size",
-        "restart_deployment",
-        "reload_server",
-    }
+WRITE_TOOLS = frozenset(
+    {"set_thread_pool_max_threads", "set_datasource_max_pool_size", "restart_deployment"}
 )
-FORBIDDEN_TOOL_NAMES = frozenset({"execute_jboss_cli", "execute_shell"})
-
-
-class NamedTool(Protocol):
-    name: str
-
-
-def _names(tools: Iterable[NamedTool]) -> set[str]:
-    return {tool.name for tool in tools}
-
-
-def validate_toolset(tools: Iterable[NamedTool]) -> None:
-    names = _names(tools)
-    expected = READ_TOOL_NAMES | WRITE_TOOL_NAMES
-    if forbidden := names & FORBIDDEN_TOOL_NAMES:
-        raise RuntimeError(f"Forbidden generic MCP tools exposed: {sorted(forbidden)}")
-    if missing := expected - names:
-        raise RuntimeError(f"Fake JBoss MCP server is missing tools: {sorted(missing)}")
-    if unexpected := names - expected:
-        raise RuntimeError(f"Unexpected MCP tools exposed: {sorted(unexpected)}")
 
 
 def build_mcp_client() -> MultiServerMCPClient:
-    """ツール取得時に、標準入出力で通信するローカル MCP サーバーを起動する。"""
+    """別 Python プロセスの MCP サーバーへ stdio で接続するクライアントを作る。
+
+    stdio 子プロセスには Fake JBoss が必要とする設定だけを明示的に渡す。
+    Gemini API Key は MCP サーバーには不要なので渡さず、プロセス境界を分かりやすく保つ。
+    """
+    settings = get_settings()
     return MultiServerMCPClient(
         {
             "fake_jboss": {
                 "transport": "stdio",
                 "command": sys.executable,
                 "args": ["-m", "jboss_agent.mcp.server"],
+                "env": {
+                    "FAKE_JBOSS_DATA_DIR": settings.fake_jboss_data_dir,
+                    "SERVER_ID": settings.server_id,
+                },
             }
         }
     )
 
 
 async def load_jboss_tools() -> tuple[list[Any], list[Any]]:
-    """読み取り専用と書き込み専用のツールを厳密に分離して返す。"""
-    client = build_mcp_client()
-    all_tools = list(await client.get_tools())
-    validate_toolset(all_tools)
+    """MCP サーバーから Tool 一覧を取得し、read と write に分けて返す。"""
+    tools = list(await build_mcp_client().get_tools())
+    names = {tool.name for tool in tools}
+    expected = READ_TOOLS | WRITE_TOOLS
+    if names != expected:
+        raise RuntimeError(f"unexpected MCP tools: expected={sorted(expected)}, actual={sorted(names)}")
+    return (
+        [tool for tool in tools if tool.name in READ_TOOLS],
+        [tool for tool in tools if tool.name in WRITE_TOOLS],
+    )
 
-    read_tools = [tool for tool in all_tools if tool.name in READ_TOOL_NAMES]
-    write_tools = [tool for tool in all_tools if tool.name in WRITE_TOOL_NAMES]
 
-    if _names(read_tools) != READ_TOOL_NAMES:
-        raise RuntimeError("Read-only MCP tool set is incomplete")
-    if _names(write_tools) != WRITE_TOOL_NAMES:
-        raise RuntimeError("Write MCP tool set is incomplete")
-    return read_tools, write_tools
+def by_name(tools: Iterable[Any], name: str) -> Any:
+    """Tool 一覧から名前が一致するものを返す。"""
+    for tool in tools:
+        if tool.name == name:
+            return tool
+    raise ValueError(f"tool not found: {name}")
+
+
+def as_dict(value: Any) -> dict[str, Any]:
+    """MCP adapter の代表的な戻り値を、このデモで扱う辞書へ正規化する。
+
+    ``langchain-mcp-adapters`` の呼び方やバージョン差により、dict / JSON 文字列 /
+    content block list / ToolMessage 風オブジェクトのいずれかが返り得る。その転送形式の
+    差だけを吸収し、Graph 側を MCP の細部で複雑にしない。
+    """
+    if isinstance(value, dict):
+        structured = value.get("structured_content")
+        if isinstance(structured, dict):
+            return structured
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            return as_dict(value["text"])
+        return value
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"raw": value}
+        return parsed if isinstance(parsed, dict) else {"raw": parsed}
+
+    if isinstance(value, (list, tuple)):
+        text_parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                structured = item.get("structured_content")
+                if isinstance(structured, dict):
+                    return structured
+                text = item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+            elif isinstance(item, str):
+                text_parts.append(item)
+        if text_parts:
+            return as_dict("\n".join(text_parts))
+        return {"raw": value}
+
+    artifact = getattr(value, "artifact", None)
+    if isinstance(artifact, dict):
+        structured = artifact.get("structured_content")
+        if isinstance(structured, dict):
+            return structured
+
+    content = getattr(value, "content", None)
+    if content is not None:
+        return as_dict(content)
+
+    return {"raw": value}
