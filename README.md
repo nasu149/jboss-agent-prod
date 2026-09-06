@@ -1,33 +1,312 @@
-# JBoss Incident Agent - Learning Minimum
+# JBoss Incident Response Agent
 
-**LangGraph / Gemini / MCP / Human-in-the-loop を、コードを追いながら学ぶための最小デモ**です。
+JBoss EAP の障害一次対応を題材に、**LangGraph / Gemini / MCP / ToolNode / Human-in-the-loop / Microsoft Teams** を組み合わせた学習用デモアプリケーションです。
 
-このリポジトリは「実運用に耐える障害対応基盤」を目指しません。
-1 人が 1 回、Fake JBoss の疑似障害を解析して、必要なら人の承認後に復旧操作を行えれば十分、という前提で意図的に単純化しています。
+実際の JBoss を直接操作するのではなく、`FakeJBoss` が `server.log` とサーバー状態をファイル上で模擬します。Agent はその疑似環境を MCP 経由で調査し、必要な復旧操作を提案します。JBoss の状態変更は Human-in-the-loop の承認後にだけ実行されます。
 
-## まず何を学ぶサンプルなのか
+## アプリケーションの目的
 
-このデモで確認するポイントは 4 つだけです。
+このアプリでは、Agent が次の流れで JBoss 障害へ対応します。
 
-1. **State**: Node 間で値がどう受け渡されるか
-2. **Conditional Edge**: Gemini の分類結果によって次の Node がどう変わるか
-3. **MCP**: LangGraph プロセスから別プロセスの Fake JBoss Tool をどう呼ぶか
-4. **Human-in-the-loop**: `interrupt()` で止まり、同じ `thread_id` を `Command(resume=...)` で再開するとはどういうことか
+1. MCP で `server.log` を取得する
+2. Gemini がログを分類する
+3. 障害なら Microsoft Teams へ通知する
+4. Gemini 自身が、追加調査に使う read-only MCP Tool を選ぶ
+5. LangGraph の `ToolNode` が選ばれた Tool を実行する
+6. 調査結果と障害種別から対処案を作る
+7. `interrupt()` でユーザー承認を待つ
+8. Approve の場合だけ MCP write Tool を実行する
+9. MCP read Tool でもう一度状態を確認し、復旧できたか判定する
 
-本番運用向けの機能は、学習の邪魔になるため削除しています。
+正常ログの場合は Teams 通知・追加調査・Human-in-the-loop・write Tool を呼ばず終了します。
 
 ---
 
-## 1. 最短で動かす
+## 全体構成
+
+```mermaid
+flowchart TB
+    U[User] --> UI[Streamlit]
+    UI --> G[LangGraph]
+
+    G --> GEMINI[Gemini]
+    G --> TEAMS[Microsoft Teams]
+
+    G --> MCPCLIENT[MCP Client]
+    MCPCLIENT -->|stdio| MCPSERVER[Fake JBoss MCP Server]
+    MCPSERVER --> FAKE[FakeJBoss]
+
+    FAKE --> LOG[server.log]
+    FAKE --> STATE[state.json]
+
+    G --> CP[InMemorySaver]
+```
+
+主な役割は次の通りです。
+
+| コンポーネント | 役割 |
+|---|---|
+| Streamlit | シナリオ投入、Agent 実行、Approve / Reject、結果表示 |
+| LangGraph | Node / Edge / State による処理制御 |
+| Gemini | ログ分類と read Tool の選択 |
+| ToolNode | Gemini が生成した Tool Call の実行 |
+| MCP | Fake JBoss の read / write 操作を Tool として公開 |
+| Teams Node | 障害検知結果を Teams へ送信 |
+| Human-in-the-loop | JBoss の変更操作を人が承認・拒否 |
+| InMemorySaver | `interrupt()` からの再開に必要な Checkpoint 保存 |
+| FakeJBoss | 疑似 server.log と疑似 JBoss 状態の保持 |
+
+---
+
+## LangGraph の処理フロー
+
+```mermaid
+flowchart TD
+    S([START]) --> RL[read_log<br/>MCP]
+    RL --> CL[classify_log<br/>Gemini]
+
+    CL -->|NORMAL_ACTIVITY| N[normal_activity]
+    CL -->|Incident| T[notify_teams]
+
+    T --> PI[prepare_investigation]
+    PI --> I[investigate<br/>Gemini chooses read Tool]
+    I --> TN[read_tools<br/>ToolNode]
+    TN --> CE[capture_tool_evidence]
+
+    CE -->|THREAD_POOL_CONFIGURATION| TP[propose_thread_pool]
+    CE -->|DATASOURCE_POOL_EXHAUSTION| DS[propose_datasource]
+    CE -->|DEPLOYMENT_FAILURE| DP[propose_deployment]
+
+    TP --> A[approval<br/>interrupt]
+    DS --> A
+    DP --> A
+
+    A -->|Approve| W[execute_fix<br/>MCP write]
+    A -->|Reject| R[rejected]
+    W --> V[verify_recovery<br/>MCP read]
+
+    N --> E([END])
+    R --> E
+    V --> E
+```
+
+### LLM に任せる部分
+
+Gemini は 2 箇所で利用します。
+
+**ログ分類**
+
+`server.log` から以下のいずれかを返します。
+
+- `THREAD_POOL_CONFIGURATION`
+- `DATASOURCE_POOL_EXHAUSTION`
+- `DEPLOYMENT_FAILURE`
+- `NORMAL_ACTIVITY`
+
+**追加調査 Tool の選択**
+
+障害の場合、Gemini に read-only MCP Tool を bind します。
+
+- `get_thread_pool_status`
+- `get_datasource_status`
+- `get_deployment_status`
+
+Gemini は障害分類・ログ・Tool の description を見て、調査に使う Tool を 1 つ選びます。
+
+### Python / LangGraph が固定している部分
+
+次は LLM に自由判断させません。
+
+- Teams 通知を行うかどうか
+- write Tool の種類と引数
+- Human approval を必須にすること
+- Approve / Reject 後の分岐
+- 復旧確認条件
+
+これにより、LLM の推論とアプリケーション制御の境界を明確にしています。
+
+---
+
+## ToolNode と MCP
+
+最初の `read_server_log` は Graph の入口で固定実行します。
+
+その後の詳細調査では、Gemini 自身が read Tool を選びます。
+
+```text
+prepare_investigation
+        ↓
+HumanMessage
+        ↓
+investigate
+        ↓
+Gemini + bind_tools(read-only MCP Tools)
+        ↓
+AIMessage(tool_calls=[...])
+        ↓
+ToolNode
+        ↓
+MCP Tool 実行
+        ↓
+ToolMessage
+        ↓
+capture_tool_evidence
+```
+
+`ToolNode` に渡しているのは read Tool だけです。write Tool は Gemini に bind せず、Human approval 後の `execute_fix` Node から Python が明示的に実行します。
+
+### MCP read Tool
+
+| Tool | 内容 |
+|---|---|
+| `read_server_log` | 疑似 `server.log` を読む |
+| `get_thread_pool_status` | Thread Pool 状態を読む |
+| `get_datasource_status` | Datasource Pool 状態を読む |
+| `get_deployment_status` | Deployment 状態を読む |
+
+### MCP write Tool
+
+| Tool | 内容 |
+|---|---|
+| `set_thread_pool_max_threads` | Thread Pool 上限を変更 |
+| `set_datasource_max_pool_size` | Datasource Pool 上限を変更 |
+| `restart_deployment` | Deployment を再起動 |
+
+MCP Server は別 Python プロセスとして起動し、LangGraph 側とは stdio で通信します。
+
+---
+
+## Microsoft Teams 通知
+
+Gemini が正常以外の category を返した場合、`notify_teams` Node を通ります。
+
+Teams 通知は MCP Tool ではなく、通常の Python Node として実装しています。
+
+送信内容は次の程度です。
+
+```text
+[JBoss Incident Detected]
+Server: jboss-01
+Category: THREAD_POOL_CONFIGURATION
+Summary: ...
+```
+
+既定値では `TEAMS_DRY_RUN=true` なので実際のネットワーク送信は行わず、送信予定 payload を State に保存します。
+
+実送信する場合は `.env` に設定します。
+
+```env
+TEAMS_DRY_RUN=false
+TEAMS_WEBHOOK_URL=https://...
+```
+
+---
+
+## Human-in-the-loop
+
+対処案が作られると `approval` Node で次を実行します。
+
+```python
+decision = interrupt({...})
+```
+
+この時点で Graph は中断し、State は Checkpointer に保存されます。
+
+Approve の場合は同じ `thread_id` で次のように再開します。
+
+```python
+Command(resume=True)
+```
+
+Reject の場合は `Command(resume=False)` で再開し、write Tool は実行せず終了します。
+
+このデモでは `InMemorySaver` を利用しているため、アプリプロセスを再起動すると Checkpoint は消えます。
+
+---
+
+## AgentState
+
+主な State は次の通りです。
+
+| Key | 内容 |
+|---|---|
+| `server_id` | 対象サーバー |
+| `log_lines` | MCP で取得した server.log |
+| `category` | Gemini の障害分類 |
+| `summary` | 分類理由 |
+| `messages` | ToolNode 用の Human / AI / Tool Message 履歴 |
+| `selected_read_tools` | Gemini が選択した read Tool |
+| `evidence` | MCP read Tool の結果と復旧確認結果 |
+| `teams_result` | Teams 通知結果 |
+| `proposed_action` | Python が作る固定対処案 |
+| `approved` | Human approval の結果 |
+| `execution_result` | MCP write Tool の結果 |
+| `recovered` | 復旧確認結果 |
+| `status` | 最終状態 |
+| `trace` | 通過した Node の順序 |
+
+画面では `selected_read_tools` と `trace` を確認できるため、Gemini がどの Tool を選び、Graph がどの Node を通ったかを追跡できます。
+
+---
+
+## 疑似障害シナリオ
+
+| Scenario | 疑似状態 | 対処 |
+|---|---|---|
+| `THREAD_POOL_CONFIGURATION` | `max_threads=20`, queue 発生 | `max_threads=80` |
+| `DATASOURCE_POOL_EXHAUSTION` | `max_pool_size=5`, timeout 発生 | `max_pool_size=30` |
+| `DEPLOYMENT_FAILURE` | `app.war=FAILED` | `restart_deployment` |
+| `NORMAL_ACTIVITY` | 正常ログ・正常状態 | 変更なし |
+
+Fake JBoss は `.data/fake_jboss/` に状態を保存します。
+
+```text
+.data/fake_jboss/
+├── server.log
+└── state.json
+```
+
+---
+
+## ディレクトリ構成
+
+```text
+.
+├── app.py
+├── README.md
+├── Dockerfile
+├── Makefile
+├── pyproject.toml
+├── .env.example
+├── docs/
+│   └── LEARNING_GUIDE.md
+├── src/jboss_agent/
+│   ├── config.py
+│   ├── fake_jboss.py
+│   ├── graph.py
+│   ├── teams.py
+│   └── mcp/
+│       ├── client.py
+│       └── server.py
+└── tests/
+    ├── test_fake_jboss.py
+    ├── test_graph.py
+    ├── test_mcp.py
+    └── test_teams.py
+```
+
+---
+
+## 実行方法
 
 前提:
 
 - Docker Desktop
 - VS Code
-- Dev Containers 拡張
+- Dev Containers
 - Gemini API Key
 
-`.env` を作ります。
+`.env` を作成します。
 
 ```bash
 cp .env.example .env
@@ -39,25 +318,13 @@ Windows PowerShell:
 Copy-Item .env.example .env
 ```
 
-API Key を設定します。
+`.env` に Gemini API Key を設定します。
 
 ```env
-GOOGLE_API_KEY=あなたのGemini API Key
+GOOGLE_API_KEY=your-api-key
 ```
 
-VS Code で:
-
-```text
-Dev Containers: Reopen in Container
-```
-
-テスト:
-
-```bash
-make test
-```
-
-アプリ起動:
+VS Code で `Dev Containers: Reopen in Container` を実行後、アプリを起動します。
 
 ```bash
 make app
@@ -69,381 +336,30 @@ make app
 http://localhost:8501
 ```
 
----
-
-## 2. 画面でやること
-
-操作はほぼ 3 ステップです。
-
-1. シナリオを選んで **「このシナリオを投入」**
-2. **「Agent を実行」**
-3. 変更が必要なら **Approve / Reject**
-
-シナリオは従来と同じ 4 種類です。
-
-- `THREAD_POOL_CONFIGURATION`
-- `DATASOURCE_POOL_EXHAUSTION`
-- `DEPLOYMENT_FAILURE`
-- `NORMAL_ACTIVITY`
-
-Fake JBoss にはシナリオ名そのものを保存しません。
-Agent は `server.log` と MCP の read Tool の結果だけを見ます。
-
----
-
-## 3. Graph 全体
-
-Graph は **1 本だけ**です。
-
-```text
-START
-  ↓
-read_log                         ← MCP
-  ↓
-classify_log                     ← Gemini
-  ↓
-Conditional Edge(category)
-  ├─ THREAD_POOL_CONFIGURATION
-  │      ↓
-  │  inspect_thread_pool         ← MCP read
-  │
-  ├─ DATASOURCE_POOL_EXHAUSTION
-  │      ↓
-  │  inspect_datasource          ← MCP read
-  │
-  ├─ DEPLOYMENT_FAILURE
-  │      ↓
-  │  inspect_deployment          ← MCP read
-  │
-  └─ NORMAL_ACTIVITY
-         ↓
-     normal_activity
-         ↓
-        END
-
-障害3系統はここで合流
-  ↓
-approval                         ← interrupt()
-  ↓
-Approve / Reject                 ← Human
-  ├─ Reject → rejected → END
-  └─ Approve
-        ↓
-    execute_fix                  ← MCP write
-        ↓
-    verify_recovery              ← MCP read
-        ↓
-       END
-```
-
-### 一番見てほしい箇所
-
-`src/jboss_agent/graph.py` のこの組み合わせです。
-
-```python
-graph.add_conditional_edges(
-    "classify_log",
-    route_category,
-    {
-        "THREAD_POOL_CONFIGURATION": "inspect_thread_pool",
-        "DATASOURCE_POOL_EXHAUSTION": "inspect_datasource",
-        "DEPLOYMENT_FAILURE": "inspect_deployment",
-        "NORMAL_ACTIVITY": "normal_activity",
-    },
-)
-```
-
-Gemini が `category` を返す → State に入る → `route_category()` が読む → 次の Node が決まる、という流れです。
-
----
-
-## 4. State は何を持つか
-
-`AgentState` は必要最小限です。
-
-| Key | 意味 |
-|---|---|
-| `server_id` | 対象 Fake JBoss |
-| `log_lines` | MCP で取得した `server.log` |
-| `category` | Gemini の分類結果 |
-| `summary` | Gemini の分類理由 |
-| `evidence` | 分岐先 MCP read Tool の結果 |
-| `proposed_action` | Python が作った固定対処案 |
-| `approved` | Human の判断 |
-| `execution_result` | MCP write Tool の結果 |
-| `recovered` | 復旧確認結果 |
-| `status` | 画面表示用の最終状態 |
-| `trace` | 通過した Node の順番 |
-
-画面の `Node trace` を見ると例えば:
-
-```text
-read_log → classify_log → inspect_thread_pool → approval → execute_fix → verify_recovery
-```
-
-と表示されます。
-
----
-
-## 5. LLM に何を任せているか
-
-Gemini に任せているのは **ログ分類だけ**です。
-
-```text
-server.log
-   ↓
-Gemini
-   ↓
-THREAD_POOL_CONFIGURATION
-or DATASOURCE_POOL_EXHAUSTION
-or DEPLOYMENT_FAILURE
-or NORMAL_ACTIVITY
-```
-
-対処 Tool 名や write 引数は Gemini に自由生成させません。
-
-たとえば thread pool なら、分岐先 Node が固定で:
-
-```text
-set_thread_pool_max_threads(value=80)
-```
-
-を対処候補として作ります。
-
-これは「LLM に任せる判断」と「Python で固定する制御」を分けて見やすくするためです。
-
----
-
-## 6. MCP はどこで使うか
-
-MCP Server は別 Python プロセスです。
-
-```text
-Streamlit / LangGraph process
-         │
-         │ stdio MCP
-         ▼
-jboss_agent.mcp.server
-         │
-         ▼
-FakeJBoss
-         │
-         ├─ state.json
-         └─ server.log
-```
-
-### read Tool
-
-- `read_server_log`
-- `get_thread_pool_status`
-- `get_datasource_status`
-- `get_deployment_status`
-
-### write Tool
-
-- `set_thread_pool_max_threads`
-- `set_datasource_max_pool_size`
-- `restart_deployment`
-
-read/write を分けていますが、複雑な RBAC や Risk Policy はありません。
-このデモでは **Human approval の後にしか write Node へ進まない**ことで境界を見せます。
-
----
-
-## 7. Human-in-the-loop と Checkpoint
-
-`approval` Node では:
-
-```python
-decision = interrupt({...})
-```
-
-を呼びます。
-
-この瞬間に Graph は停止します。
-
-今回は 1 人・1 回だけなので、SQLite や PostgreSQL は使わず:
-
-```python
-InMemorySaver()
-```
-
-を Checkpointer にしています。
-
-ただし HITL の基本原理は同じです。
-
-```text
-初回 invoke
-  ↓
-interrupt()
-  ↓
-State を Checkpointer に保存
-  ↓
-画面で Approve
-  ↓
-Command(resume=True)
-  ↓
-同じ thread_id
-  ↓
-approval Node から再開
-```
-
-重要なのは、**Python thread をずっと待機させているわけではない**ことです。
-
-このサンプルでは Streamlit の `session_state` に `InMemorySaver` を置くため、アプリプロセスを再起動すると Checkpoint は消えます。それで問題ない、という学習用の割り切りです。
-
----
-
-## 8. Fake JBoss
-
-実 JBoss を立てると学習対象が増えすぎるため、次だけを JSON / log で模擬します。
-
-```text
-.data/fake_jboss/
-├── state.json
-└── server.log
-```
-
-3 障害は非常に単純です。
-
-### Thread Pool
-
-```text
-max_threads=20
-active_threads=20
-queue_size=37
-```
-
-承認後:
-
-```text
-max_threads=80
-queue_size=0
-```
-
-### Datasource
-
-```text
-max_pool_size=5
-timed_out_requests=14
-```
-
-承認後:
-
-```text
-max_pool_size=30
-timed_out_requests=0
-```
-
-### Deployment
-
-```text
-app.war status=FAILED
-```
-
-承認後:
-
-```text
-app.war status=OK
-```
-
-現実の JBoss の挙動として正確であることより、LangGraph の処理を追いやすいことを優先しています。
-
----
-
-## 9. ディレクトリ構成
-
-```text
-.
-├── app.py
-├── README.md
-├── Dockerfile
-├── Makefile
-├── pyproject.toml
-├── .env.example
-├── .devcontainer/
-├── .streamlit/
-├── docs/
-│   └── LEARNING_GUIDE.md
-├── src/jboss_agent/
-│   ├── config.py
-│   ├── fake_jboss.py
-│   ├── graph.py
-│   └── mcp/
-│       ├── client.py
-│       └── server.py
-└── tests/
-    ├── test_fake_jboss.py
-    ├── test_graph.py
-    └── test_mcp.py
-```
-
-コードを読む順番は:
-
-1. `graph.py`
-2. `app.py`
-3. `mcp/client.py`
-4. `mcp/server.py`
-5. `fake_jboss.py`
-
-がおすすめです。
-
----
-
-## 10. 今回あえて削ったもの
-
-以前の構成には以下がありましたが、今回の学習目的には過剰なので削除しました。
-
-- Monitoring Graph と Incident Graph の 2 Graph 構成
-- ログ byte cursor と定期監視の状態管理
-- Incident ID 管理
-- Runtime SQLite
-- Ground Truth SQLite
-- SQLite Checkpointer
-- Service 層
-- Teams 通知
-- Agentic read Tool loop
-- LLM 診断用の別モデル呼び出し
-- Risk Policy
-- 値編集付き承認
-- 復旧失敗時の再調査 loop
-- 複数 Incident / 複数 user を想定した永続化
-
-これらは「必要になった段階で 1 個ずつ追加する」方が LangGraph を理解しやすいです。
-
----
-
-## 11. テスト
+テストと lint:
 
 ```bash
 make check
 ```
 
-確認内容:
-
-- 3 障害が Fake JBoss 上で復旧できる
-- LLM category ごとに期待した Node へ分岐する
-- `interrupt()` 前には write が走らない
-- `Command(resume=True)` で同じ Checkpoint を再開して write が走る
-- Reject なら write が走らない
-- `NORMAL_ACTIVITY` は HITL なしで終了する
-- 実際に stdio MCP Server を起動し Tool を取得・実行できる
-
-PR では GitHub Actions でも `ruff` と `pytest` を実行します。
-
 ---
 
-## 12. 次に機能を足すなら
+## テスト範囲
 
-この最小版を理解したあとに、学習目的ごとに 1 個ずつ足すのがおすすめです。
+GitHub Actions でも `ruff check .` と `pytest -q` を実行します。
 
-```text
-Step 1  ← 今ここ: 1 Graph / 1 run / InMemorySaver
-Step 2  ToolNode を使って LLM 自身に read Tool を選ばせる
-Step 3  SQLite Checkpointer に変える
-Step 4  監視 cursor を追加する
-Step 5  復旧失敗時の retry loop を追加する
-Step 6  Teams の Local Tool を追加する
-```
+主な確認内容:
 
-最初から全部入りに戻さないことが、このリポジトリを学習教材として使う上でのポイントです。
+- 3 種類の疑似障害の復旧
+- Gemini category による正常 / 障害分岐
+- Gemini が生成した Tool Call を `ToolNode` が実行すること
+- 選択された read Tool だけが呼ばれること
+- 正常系では Teams / ToolNode / HITL を通らないこと
+- 障害系では Teams Node を通ること
+- `interrupt()` 前に write Tool が実行されないこと
+- `Command(resume=True)` で write Tool が実行されること
+- Reject では write Tool が実行されないこと
+- stdio MCP Server の実 Tool 呼び出し
+- Teams dry-run / URL 未設定時の動作
+
+詳細な Node / State / ToolMessage の流れは [`docs/LEARNING_GUIDE.md`](docs/LEARNING_GUIDE.md) を参照してください。

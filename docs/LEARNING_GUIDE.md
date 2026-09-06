@@ -1,371 +1,607 @@
-# LangGraph / MCP / Human-in-the-loop 学習ガイド
+# JBoss Incident Response Agent 詳細設計・処理フロー
 
-この文書は `README.md` より 1 段コード寄りに、**何をすると State がどう変わり、次にどの Node が呼ばれるか**を説明します。
+この文書は、`jboss-agent-prod` の主要コンポーネント、LangGraph の Node / Edge、State 遷移、MCP Tool、ToolNode、Human-in-the-loop、Teams 通知の関係を実装に近い粒度で説明します。
 
-## 1. 1 回の実行フロー
+## 1. システム構成
+
+```mermaid
+flowchart LR
+    USER[User] --> UI[Streamlit app.py]
+    UI --> GRAPH[LangGraph graph.py]
+
+    GRAPH --> GEMINI[Gemini]
+    GRAPH --> TEAMS[teams.py]
+    GRAPH --> MCPCLIENT[mcp/client.py]
+
+    MCPCLIENT -->|stdio| MCPSERVER[mcp/server.py]
+    MCPSERVER --> FAKE[fake_jboss.py]
+    FAKE --> LOG[server.log]
+    FAKE --> JSON[state.json]
+
+    GRAPH --> CHECKPOINT[InMemorySaver]
+```
+
+### コンポーネント責務
+
+| ファイル | 責務 |
+|---|---|
+| `app.py` | UI、Graph 開始/再開、Approve / Reject、State 表示 |
+| `graph.py` | State、Node、Edge、Gemini、ToolNode、HITL の構成 |
+| `mcp/client.py` | MCP Server 起動、Tool 取得、read/write 分離 |
+| `mcp/server.py` | Fake JBoss 操作を MCP Tool として公開 |
+| `fake_jboss.py` | 疑似ログ・疑似 JBoss 状態・障害投入 |
+| `teams.py` | Teams Webhook 送信 |
+| `config.py` | Gemini / Teams / Fake JBoss 設定 |
+
+---
+
+## 2. Graph 定義
 
 ```mermaid
 flowchart TD
-    S([START]) --> RL[read_log]
+    START([START]) --> RL[read_log]
     RL --> CL[classify_log]
-    CL -->|THREAD_POOL_CONFIGURATION| TP[inspect_thread_pool]
-    CL -->|DATASOURCE_POOL_EXHAUSTION| DS[inspect_datasource]
-    CL -->|DEPLOYMENT_FAILURE| DP[inspect_deployment]
-    CL -->|NORMAL_ACTIVITY| N[normal_activity]
 
-    TP --> A[approval / interrupt]
-    DS --> A
-    DP --> A
+    CL -->|NORMAL_ACTIVITY| NORMAL[normal_activity]
+    CL -->|3 incident categories| TEAMS[notify_teams]
 
-    A -->|Approve| W[execute_fix]
-    A -->|Reject| R[rejected]
-    W --> V[verify_recovery]
+    TEAMS --> PREP[prepare_investigation]
+    PREP --> INV[investigate]
+    INV --> TOOLS[read_tools / ToolNode]
+    TOOLS --> CAP[capture_tool_evidence]
 
-    N --> E([END])
-    R --> E
-    V --> E
+    CAP -->|THREAD_POOL_CONFIGURATION| PTP[propose_thread_pool]
+    CAP -->|DATASOURCE_POOL_EXHAUSTION| PDS[propose_datasource]
+    CAP -->|DEPLOYMENT_FAILURE| PDP[propose_deployment]
+
+    PTP --> APPROVAL[approval / interrupt]
+    PDS --> APPROVAL
+    PDP --> APPROVAL
+
+    APPROVAL -->|True| EXEC[execute_fix]
+    APPROVAL -->|False| REJECT[rejected]
+
+    EXEC --> VERIFY[verify_recovery]
+
+    NORMAL --> END([END])
+    REJECT --> END
+    VERIFY --> END
 ```
 
-## 2. Node ごとの State 変化
+Graph は 1 本だけです。正常系と障害系は `classify_log` 後の Conditional Edge で分かれます。
 
-### 初期 State
+---
 
-`app.py` は Graph を次の程度の State で開始します。
-
-```python
-{
-    "server_id": "jboss-01",
-    "trace": [],
-}
-```
-
-### `read_log`
-
-MCP:
+## 3. AgentState
 
 ```text
-read_server_log(server_id="jboss-01")
+AgentState
+├─ server_id
+├─ log_lines
+├─ category
+├─ summary
+├─ messages
+├─ selected_read_tools
+├─ evidence
+├─ teams_result
+├─ proposed_action
+├─ approved
+├─ execution_result
+├─ recovered
+├─ status
+└─ trace
 ```
 
-更新:
+### `messages`
+
+`messages` は `add_messages` reducer を持ちます。
+
+```python
+messages: Annotated[list[Any], add_messages]
+```
+
+ToolNode は LangGraph / LangChain の標準 message 形式を利用するため、この State に次が順番に追加されます。
+
+```text
+HumanMessage
+   ↓
+AIMessage(tool_calls=[...])
+   ↓
+ToolMessage
+```
+
+### `trace`
+
+`trace` は教材用の単純な Node 通過履歴です。
+
+Thread Pool 障害を Approve した場合の例:
+
+```text
+read_log
+→ classify_log
+→ notify_teams
+→ prepare_investigation
+→ investigate
+→ read_tools
+→ propose_thread_pool
+→ approval
+→ execute_fix
+→ verify_recovery
+```
+
+---
+
+## 4. Node 詳細
+
+| Node | 主な入力 | 処理 | 主な更新 |
+|---|---|---|---|
+| `read_log` | `server_id` | MCP `read_server_log` | `log_lines` |
+| `classify_log` | `log_lines` | Gemini Structured Output | `category`, `summary` |
+| `notify_teams` | `server_id`, `category`, `summary` | Teams 通知 | `teams_result` |
+| `prepare_investigation` | category / log | 調査依頼を作成 | `messages` |
+| `investigate` | `messages` | Gemini が read Tool を選択 | `AIMessage` |
+| `read_tools` | AIMessage Tool Call | `ToolNode` が MCP Tool 実行 | `ToolMessage` |
+| `capture_tool_evidence` | ToolMessage | Tool 結果を辞書化 | `selected_read_tools`, `evidence` |
+| `propose_*` | category | 固定対処案を作成 | `proposed_action` |
+| `approval` | proposed action | `interrupt()` | resume 後 `approved` |
+| `execute_fix` | approved/action | MCP write Tool 実行 | `execution_result` |
+| `verify_recovery` | category | MCP read Tool で確認 | `recovered`, `status` |
+| `rejected` | approval=False | 書込せず終了 | `status=REJECTED` |
+| `normal_activity` | category=NORMAL | 何も変更せず終了 | `status=NO_INCIDENT` |
+
+---
+
+## 5. ログ分類
+
+`read_log` は MCP の `read_server_log` を固定で呼びます。
+
+```text
+LangGraph
+  ↓
+MCP Client
+  ↓ stdio
+MCP Server
+  ↓
+FakeJBoss.read_server_log()
+```
+
+取得したログを `classify_log` が Gemini へ渡します。
+
+Gemini の出力は `LogAnalysis` の JSON Schema で制約します。
+
+```python
+class LogAnalysis(BaseModel):
+    category: Category
+    summary: str
+```
+
+`category` は次の 4 値だけです。
+
+```text
+THREAD_POOL_CONFIGURATION
+DATASOURCE_POOL_EXHAUSTION
+DEPLOYMENT_FAILURE
+NORMAL_ACTIVITY
+```
+
+正常なら `normal_activity` へ進みます。障害なら `notify_teams` へ進みます。
+
+---
+
+## 6. Teams 通知
+
+`notify_teams` は通常の LangGraph Node です。
+
+```text
+classify_log
+   ↓ incident
+notify_teams
+   ↓
+teams.py
+   ↓
+Microsoft Teams Webhook
+```
+
+MCP 経由ではありません。
+
+これは JBoss の Capability と Teams 通知を別の連携として扱うためです。
+
+State に次のような結果が残ります。
 
 ```python
 {
-    "log_lines": [...],
-    "trace": ["read_log"],
+    "success": True,
+    "status": "dry_run",
+    "payload": {
+        "text": "[JBoss Incident Detected] ..."
+    }
 }
 ```
 
-### `classify_log`
+既定では `TEAMS_DRY_RUN=true` です。
 
-Gemini に `log_lines` を渡します。
+---
 
-例:
+## 7. Gemini による read Tool 選択
 
-```python
-{
-    "category": "THREAD_POOL_CONFIGURATION",
-    "summary": "worker queue and rejected tasks are visible",
-    "trace": ["read_log", "classify_log"],
-}
-```
+### 7.1 bind する Tool
 
-ここで重要なのは、**LLM が Node 名を直接返しているわけではない**ことです。
-LLM は業務上の意味である `category` を返します。
-
-その後 `route_category(state)` が:
-
-```python
-return state["category"]
-```
-
-を行い、Conditional Edge の mapping が Node を決めます。
-
-### `inspect_thread_pool`
-
-MCP:
+`build_investigator()` は read Tool のうち、詳細調査用の 3 Tool だけを Gemini に bind します。
 
 ```text
 get_thread_pool_status
+get_datasource_status
+get_deployment_status
 ```
 
-更新例:
+`read_server_log` はすでに入口 Node で実行済みなので bind 対象から外します。
+
+write Tool は一切 bind しません。
 
 ```python
-{
-    "evidence": {
-        "max_threads": 20,
-        "active_threads": 20,
-        "queue_size": 37,
-    },
-    "proposed_action": {
-        "tool": "set_thread_pool_max_threads",
-        "args": {"server_id": "jboss-01", "value": 80},
-        "description": "thread pool の max_threads を 80 に戻す",
-    },
-    "trace": [..., "inspect_thread_pool"],
-}
+model.bind_tools(diagnostic_tools, tool_choice="any")
 ```
 
-Datasource / Deployment も同じ構造です。
+`tool_choice="any"` により、調査 Node では Tool Call を要求します。Prompt では「最も適切な 1 Tool だけ選ぶ」よう指示します。
 
-### `approval`
+### 7.2 Message の流れ
 
-`interrupt(payload)` を呼ぶため、**初回は Node が return しません**。
+`prepare_investigation` が `HumanMessage` を作ります。
 
-画面側には:
+例:
 
-```python
-result["__interrupt__"]
+```text
+Server: jboss-01
+Category: THREAD_POOL_CONFIGURATION
+server.log: ...
+Choose exactly ONE bound read-only tool...
 ```
 
-が返ります。
-
-Checkpoint には `approval` に到達する直前までの State が保存されます。
-
-Approve の場合:
+`investigate` が Gemini を呼ぶと、例えば次の `AIMessage` が返ります。
 
 ```python
-graph.ainvoke(
-    Command(resume=True),
-    config={"configurable": {"thread_id": same_thread_id}},
+AIMessage(
+    tool_calls=[
+        {
+            "name": "get_thread_pool_status",
+            "args": {"server_id": "jboss-01"}
+        }
+    ]
 )
 ```
 
-再開すると `interrupt()` の戻り値が `True` になり、初めて Node が:
+この時点では Tool はまだ実行されていません。
+
+---
+
+## 8. ToolNode の動作
+
+`read_tools` Node は LangGraph の `ToolNode` です。
 
 ```python
-{
-    "approved": True,
-    "trace": [..., "approval"],
-}
+graph.add_node("read_tools", ToolNode(diagnostic_tools))
 ```
 
-を返します。
-
-### `execute_fix`
-
-`approved is True` を確認してから、`proposed_action` の write MCP Tool を呼びます。
+ToolNode は最新の `AIMessage.tool_calls` を読み、名前が一致する Tool を実行します。
 
 Thread Pool の例:
 
 ```text
-set_thread_pool_max_threads(server_id="jboss-01", value=80)
+AIMessage
+ tool_calls:
+   get_thread_pool_status(server_id="jboss-01")
+       ↓
+ToolNode
+       ↓
+LangChain MCP Tool
+       ↓
+stdio MCP Server
+       ↓
+FakeJBoss.get_thread_pool_status()
+       ↓
+ToolMessage
 ```
 
-更新:
+`capture_tool_evidence` が ToolMessage を辞書へ変換し、State に保存します。
 
 ```python
-{
-    "execution_result": {...},
-    "trace": [..., "execute_fix"],
+selected_read_tools = ["get_thread_pool_status"]
+
+evidence = {
+    "get_thread_pool_status": {
+        "max_threads": 20,
+        "active_threads": 20,
+        "queue_size": 37
+    }
 }
 ```
 
-### `verify_recovery`
-
-もう一度 read MCP Tool を呼びます。
-
-```python
-{
-    "recovered": True,
-    "status": "RECOVERED",
-    "trace": [..., "verify_recovery"],
-}
-```
-
-そして END です。
+この構成では LLM が **何を調べるか** を選び、ToolNode が **その Tool Call を実行する** 役割です。
 
 ---
 
-## 3. 具体例: Thread Pool 障害
+## 9. category と対処案
 
-### ① シナリオ投入
-
-Fake JBoss:
-
-```text
-max_threads = 20
-active_threads = 20
-queue_size = 37
-```
-
-ログ:
-
-```text
-WARN HTTP worker queue is growing
-ERROR task rejected from worker executor
-WARN HTTP 503 responses increased
-```
-
-### ② Graph 開始
-
-```text
-START
- ↓
-read_log
-```
-
-State:
-
-```python
-server_id = "jboss-01"
-log_lines = [...]
-```
-
-### ③ Gemini 分類
-
-```text
-classify_log
-```
-
-State:
-
-```python
-category = "THREAD_POOL_CONFIGURATION"
-```
-
-### ④ Conditional Edge
+ToolNode の実行後、`category` に応じて Conditional Edge で 3 Node に分かれます。
 
 ```text
 THREAD_POOL_CONFIGURATION
+  → propose_thread_pool
+
+DATASOURCE_POOL_EXHAUSTION
+  → propose_datasource
+
+DEPLOYMENT_FAILURE
+  → propose_deployment
+```
+
+対処内容は固定です。
+
+| Category | write Tool | Args |
+|---|---|---|
+| Thread Pool | `set_thread_pool_max_threads` | `value=80` |
+| Datasource | `set_datasource_max_pool_size` | `value=30` |
+| Deployment | `restart_deployment` | `deployment_name=app.war` |
+
+LLM は write Tool 名や write 引数を生成しません。
+
+---
+
+## 10. Human-in-the-loop
+
+`approval` Node は `interrupt()` を実行します。
+
+```python
+decision = interrupt({...})
+```
+
+初回 Graph 実行では、この Node は return せず中断します。
+
+```text
+... → propose_thread_pool
           ↓
-inspect_thread_pool
+       approval
+          ↓
+      interrupt
+          ↓
+Graph returns __interrupt__
 ```
 
-この部分が **LLM の判断結果によって Graph の実行経路が変わるところ**です。
+Checkpoint には再開に必要な State が保存されます。
 
-### ⑤ MCP read
+Streamlit で Approve を押すと:
 
-```text
-get_thread_pool_status
-```
-
-State に evidence と proposed_action が増えます。
-
-### ⑥ HITL
-
-```text
-approval
-  ↓
-interrupt()
-```
-
-ここで Python 処理は終了してよく、Checkpointer が再開地点を覚えます。
-
-### ⑦ Approve
-
-```text
+```python
 Command(resume=True)
 ```
 
-同じ `thread_id` を使います。
-
-### ⑧ MCP write
+を同じ `thread_id` で渡します。
 
 ```text
-set_thread_pool_max_threads(80)
+same Checkpointer
+same thread_id
+Command(resume=True)
+        ↓
+approval resumes
+        ↓
+execute_fix
 ```
 
-### ⑨ MCP read で確認
+Reject の場合は `rejected` へ進み、MCP write Tool は実行されません。
+
+---
+
+## 11. write Tool と復旧確認
+
+`execute_fix` は `approved is True` を確認します。
+
+その後 `proposed_action` の Tool 名を、あらかじめ取得済みの write Tool 集合から検索して直接実行します。
 
 ```text
-get_thread_pool_status
+execute_fix
+   ↓
+MCP write Tool
+   ↓
+Fake JBoss state change
 ```
+
+その後 `verify_recovery` が read Tool を直接呼びます。
+
+### Thread Pool
 
 ```text
-max_threads = 80
-queue_size = 0
+max_threads >= 80
+queue_size == 0
 ```
 
-### ⑩ END
+### Datasource
+
+```text
+max_pool_size >= 30
+timed_out_requests == 0
+```
+
+### Deployment
+
+```text
+status == OK
+```
+
+成功なら:
 
 ```python
+status = "RECOVERED"
+recovered = True
+```
+
+となります。
+
+---
+
+## 12. 具体的な状態遷移例
+
+Thread Pool 障害で Gemini が `get_thread_pool_status` を選び、人が Approve した場合です。
+
+### Initial
+
+```python
+{
+    "server_id": "jboss-01",
+    "trace": []
+}
+```
+
+### read_log
+
+```python
+log_lines = [
+    "WARN HTTP worker queue is growing",
+    "ERROR task rejected from worker executor",
+    ...
+]
+```
+
+### classify_log
+
+```python
+category = "THREAD_POOL_CONFIGURATION"
+summary = "worker queue and rejected tasks indicate thread pool pressure"
+```
+
+### notify_teams
+
+```python
+teams_result = {
+    "success": True,
+    "status": "dry_run"
+}
+```
+
+### investigate
+
+```python
+messages = [
+    HumanMessage(...),
+    AIMessage(tool_calls=[get_thread_pool_status])
+]
+```
+
+### read_tools / ToolNode
+
+```python
+messages += [ToolMessage(...)]
+selected_read_tools = ["get_thread_pool_status"]
+```
+
+### propose_thread_pool
+
+```python
+proposed_action = {
+    "tool": "set_thread_pool_max_threads",
+    "args": {
+        "server_id": "jboss-01",
+        "value": 80
+    }
+}
+```
+
+### approval
+
+```text
+interrupt → Approve
+```
+
+### execute_fix
+
+```text
+set_thread_pool_max_threads(value=80)
+```
+
+### verify_recovery
+
+```python
+recovered = True
 status = "RECOVERED"
 ```
 
 ---
 
-## 4. なぜ InMemorySaver なのか
+## 13. プロセス境界
 
-HITL では Checkpointer 自体は必要です。
+Streamlit / LangGraph と MCP Server は別プロセスです。
 
-しかし今回必要なのは:
+```mermaid
+sequenceDiagram
+    participant G as Streamlit / LangGraph
+    participant C as MultiServerMCPClient
+    participant M as MCP Server Process
+    participant F as FakeJBoss
 
-```text
-interrupt で止まる
-  ↓
-Approve ボタンを押す
-  ↓
-同じ thread_id で再開する
+    G->>C: get_tools()
+    C->>M: python -m jboss_agent.mcp.server
+    M-->>C: Tool metadata
+    G->>C: tool.ainvoke(args)
+    C->>M: MCP request over stdio
+    M->>F: method call
+    F-->>M: dict result
+    M-->>C: MCP Tool result
+    C-->>G: LangChain Tool result
 ```
 
-という **Checkpoint の概念を理解すること**だけです。
-
-そのため:
-
-```python
-InMemorySaver()
-```
-
-で十分です。
-
-SQLite にすると、次の学習テーマが一気に増えます。
-
-- DB ファイル lifecycle
-- cursor 永続化
-- Incident ID
-- Streamlit 再起動後の復元
-- 複数 thread の管理
-- stale checkpoint の扱い
-
-これらは「永続化を学ぶ Step」で追加すればよく、最初の LangGraph 学習には不要です。
+両プロセスは `.data/fake_jboss/state.json` と `server.log` を通して同じ Fake JBoss 状態を参照します。
 
 ---
 
-## 5. MCP と普通の Python 関数の違いをこのコードで見る
+## 14. 設定
 
-シナリオ投入は UI が直接:
+`.env` の主要項目:
 
-```python
-fake.inject(...)
-```
+| Key | 内容 |
+|---|---|
+| `GOOGLE_API_KEY` | Gemini API Key |
+| `GEMINI_MODEL` | Gemini model |
+| `TEAMS_DRY_RUN` | Teams を実送信しない場合 `true` |
+| `TEAMS_WEBHOOK_URL` | Teams Webhook URL |
+| `SERVER_ID` | Fake server ID |
+| `FAKE_JBOSS_DATA_DIR` | 疑似状態保存先 |
 
-を呼びます。
-
-一方 Agent が JBoss を調査するときは:
-
-```text
-LangGraph Node
-  ↓
-LangChain MCP Tool
-  ↓ stdio
-MCP Server
-  ↓
-FakeJBoss method
-```
-
-です。
-
-つまり「同じ FakeJBoss のメソッドを使っていても、Agent から見える能力は MCP Server が公開した Tool だけ」という境界を確認できます。
+MCP Server 子プロセスには Fake JBoss に必要な `SERVER_ID` と `FAKE_JBOSS_DATA_DIR` だけを明示的に渡します。
 
 ---
 
-## 6. 割り切っている点
+## 15. テスト観点
 
-これは意図的な教材上の簡略化です。
+`tests/test_graph.py` では、実 Gemini の代わりに Stub を利用し、次を確認します。
+
+- category ごとの分岐
+- Gemini が選んだ Tool 名を ToolNode が実行すること
+- 選ばれていない read Tool は呼ばれないこと
+- Teams Node が障害時だけ実行されること
+- `interrupt()` 前に write が発生しないこと
+- Approve 後に write が実行されること
+- Reject では write が実行されないこと
+- 正常系が Teams / ToolNode / HITL を通らないこと
+
+`tests/test_mcp.py` では実際に stdio MCP Server を起動して read / write Tool の往復を確認します。
+
+`tests/test_teams.py` では dry-run と Webhook URL 未設定時の動作を確認します。
+
+GitHub Actions では `ruff check .` と `pytest -q` を実行します。
+
+---
+
+## 16. デモとしての前提
+
+このアプリは JBoss 障害対応の業務ロジックを忠実に再現することより、Agent の構造を分かりやすく確認できることを優先しています。
 
 - 1 user
-- 1 server
+- 1 Fake JBoss server
 - 1 incident at a time
-- 1 run
-- in-memory checkpoint
-- no authentication
-- no production audit log
-- no monitoring scheduler
-- no retry
-- fixed remediation values
-- no LLM-generated write arguments
-- Fake JBoss behavior is simplified
+- Checkpoint は memory only
+- 監視 scheduler なし
+- 認証 / RBAC なし
+- retry loop なし
+- write の値は固定
+- Fake JBoss の復旧挙動は単純化
 
-これらの制約によって、`graph.py` を上から読めば処理全体を追える状態を優先しています。
+一方で、LLM / ToolNode / MCP / Teams / Human approval の境界は実装上明示的に分けています。
